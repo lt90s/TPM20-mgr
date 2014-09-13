@@ -1,0 +1,3253 @@
+diff --git a/extras/mini-os/include/tpm_tis.h b/extras/mini-os/include/tpm_tis.h
+index 1faca0d..86e83f1 100644
+--- a/extras/mini-os/include/tpm_tis.h
++++ b/extras/mini-os/include/tpm_tis.h
+@@ -36,6 +36,7 @@
+ struct tpm_chip;
+ 
+ struct tpm_chip* init_tpm_tis(unsigned long baseaddr, int localities, unsigned int irq);
++struct tpm_chip* init_tpm2_tis(unsigned long baseaddr, int localities, unsigned int irq);
+ void shutdown_tpm_tis(struct tpm_chip* tpm);
+ 
+ int tpm_tis_request_locality(struct tpm_chip* tpm, int locality);
+diff --git a/extras/mini-os/tpm_tis.c b/extras/mini-os/tpm_tis.c
+index e8ca69f..20d1e24 100644
+--- a/extras/mini-os/tpm_tis.c
++++ b/extras/mini-os/tpm_tis.c
+@@ -1350,5 +1350,160 @@ int tpm_tis_posix_fstat(int fd, struct stat* buf)
+    return 0;
+ }
+ 
++/* TPM 2.0 */
+ 
++void tpm2_selftest(struct tpm_chip* chip)
++{
++   uint8_t data[] = {
++      0x80, 0x1,
++      0x0, 0x0, 0x0, 0xb,
++      0x0, 0x0, 0x1, 0x43,
++      0x1,
++   };
++
++   tpm_transmit(chip, data, sizeof(data));
++}
++
++struct tpm_chip* init_tpm2_tis(unsigned long baseaddr, int localities, unsigned int irq)
++{
++   int i;
++   unsigned long addr;
++   struct tpm_chip* tpm = NULL;
++   uint32_t didvid;
++   uint32_t intfcaps;
++   uint32_t intmask;
++
++   printk("============= Init TPM2 TIS Driver ==============\n");
++
++   /*Sanity check the localities input */
++   if(localities & ~TPM_TIS_EN_LOCLALL) {
++      printk("init_tpm2_tis() Invalid locality specification! %X\n", localities);
++      goto abort_egress;
++   }
++
++   printk("IOMEM Machine Base Address: %lX\n", baseaddr);
++
++   /* Create the tpm data structure */
++   tpm = malloc(sizeof(struct tpm_chip));
++   __init_tpm_chip(tpm);
++
++   /* Set the enabled localities - if 0 we leave default as all enabled */
++   if(localities != 0) {
++      tpm->enabled_localities = localities;
++   }
++   printk("Enabled Localities: ");
++   for(i = 0; i < 5; ++i) {
++      if(locality_enabled(tpm, i)) {
++     printk("%d ", i);
++      }
++   }
++   printk("\n");
++
++   /* Set the base machine address */
++   tpm->baseaddr = baseaddr;
++
++   /* Set default timeouts */
++   tpm->timeout_a = MILLISECS(TIS_SHORT_TIMEOUT);
++   tpm->timeout_b = MILLISECS(TIS_LONG_TIMEOUT);
++   tpm->timeout_c = MILLISECS(TIS_SHORT_TIMEOUT);
++   tpm->timeout_d = MILLISECS(TIS_SHORT_TIMEOUT);
++
++   /*Map the mmio pages */
++   addr = tpm->baseaddr;
++   for(i = 0; i < 5; ++i) {
++      if(locality_enabled(tpm, i)) {
++
++         /* Map the page in now */
++         if((tpm->pages[i] = ioremap_nocache(addr, PAGE_SIZE)) == NULL) {
++            printk("Unable to map iomem page a address %p\n", addr);
++            goto abort_egress;
++         }
++
++         /* Set default locality to the first enabled one */
++         if (tpm->locality < 0) {
++            if(tpm_tis_request_locality(tpm, i) < 0) {
++               printk("Unable to request locality %d??\n", i);
++               goto abort_egress;
++            }
++         }
++      }
++      addr += PAGE_SIZE;
++   }
++
++   /* Get the vendor and device ids */
++   didvid = ioread32(TPM_DID_VID(tpm, tpm->locality));
++   tpm->did = didvid >> 16;
++   tpm->vid = didvid & 0xFFFF;
++
++   /* Get the revision id */
++   tpm->rid = ioread8(TPM_RID(tpm, tpm->locality));
++
++   printk("2.0 TPM (device-id=0x%X vendor-id = %X rev-id = %X)\n", tpm->did, tpm->vid, tpm->rid);
++
++   intfcaps = ioread32(TPM_INTF_CAPS(tpm, tpm->locality));
++   printk("TPM interface capabilities (0x%x):\n", intfcaps);
++   if (intfcaps & TPM_INTF_BURST_COUNT_STATIC)
++      printk("\tBurst Count Static\n");
++   if (intfcaps & TPM_INTF_CMD_READY_INT)
++      printk("\tCommand Ready Int Support\n");
++   if (intfcaps & TPM_INTF_INT_EDGE_FALLING)
++      printk("\tInterrupt Edge Falling\n");
++   if (intfcaps & TPM_INTF_INT_EDGE_RISING)
++      printk("\tInterrupt Edge Rising\n");
++   if (intfcaps & TPM_INTF_INT_LEVEL_LOW)
++      printk("\tInterrupt Level Low\n");
++   if (intfcaps & TPM_INTF_INT_LEVEL_HIGH)
++      printk("\tInterrupt Level High\n");
++   if (intfcaps & TPM_INTF_LOCALITY_CHANGE_INT)
++      printk("\tLocality Change Int Support\n");
++   if (intfcaps & TPM_INTF_STS_VALID_INT)
++      printk("\tSts Valid Int Support\n");
++   if (intfcaps & TPM_INTF_DATA_AVAIL_INT)
++      printk("\tData Avail Int Support\n");
++
++   /*Interupt setup */
++   intmask = ioread32(TPM_INT_ENABLE(tpm, tpm->locality));
++
++   intmask |= TPM_INTF_CMD_READY_INT
++      | TPM_INTF_LOCALITY_CHANGE_INT | TPM_INTF_DATA_AVAIL_INT
++      | TPM_INTF_STS_VALID_INT;
++
++   iowrite32(TPM_INT_ENABLE(tpm, tpm->locality), intmask);
++
++   /*If interupts are enabled, handle it */
++   if(irq) {
++      if(irq != TPM_PROBE_IRQ) {
++         tpm->irq = irq;
++      } else {
++         /*FIXME add irq probing feature later */
++         printk("IRQ probing not implemented\n");
++      }
++   }
++
++   if(tpm->irq) {
++      iowrite8(TPM_INT_VECTOR(tpm, tpm->locality), tpm->irq);
++
++      if(bind_pirq(tpm->irq, 1, tpm_tis_irq_handler, tpm) != 0) {
++         printk("Unabled to request irq: %u for use\n", tpm->irq);
++         printk("Will use polling mode\n");
++         tpm->irq = 0;
++      } else {
++
++         /* Clear all existing */
++         iowrite32(TPM_INT_STATUS(tpm, tpm->locality), ioread32(TPM_INT_STATUS(tpm, tpm->locality)));
++
++         /* Turn on interrupts */
++         iowrite32(TPM_INT_ENABLE(tpm, tpm->locality), intmask | TPM_GLOBAL_INT_ENABLE);
++      }
++   }
++
++   tpm2_selftest(tpm);
++
++   return tpm;
++abort_egress:
++   if(tpm != NULL) {
++      shutdown_tpm_tis(tpm);
++   }
++   return NULL;
++}
+ #endif
+diff --git a/stubdom/vtpmmgr/init.c b/stubdom/vtpmmgr/init.c
+index 33ac152..010bcb3 100644
+--- a/stubdom/vtpmmgr/init.c
++++ b/stubdom/vtpmmgr/init.c
+@@ -51,6 +51,7 @@
+ #include "vtpm_storage.h"
+ #include "tpm.h"
+ #include "marshal.h"
++#include "tpm2_types.h"
+ 
+ struct Opts {
+    enum {
+@@ -557,3 +558,242 @@ void vtpmmgr_shutdown(void)
+ 
+    vtpmloginfo(VTPM_LOG_VTPM, "VTPM Manager stopped.\n");
+ }
++
++/* TPM 2.0, init vtpmmgr2 */
++
++static TPM_RC flush_tpm2(void)
++{
++   UINT32 handle = 0x80000000;
++   int i;
++   for (i = 0; i < 4; i++)
++       TPM2_FlushContext(handle + i);
++
++   return TPM_SUCCESS;
++}
++
++static void tpm_AuthArea_ctor(const char *authValue, UINT32 authLen, TPM_AuthArea *auth)
++{
++   auth->sessionHandle = TPM_RS_PW;
++   auth->nonce.size = 0;
++   auth->sessionAttributes = 1;
++   auth->auth.size = authLen;
++   memcpy(auth->auth.buffer, authValue, authLen);
++   auth->size = 9 + authLen;
++}
++
++TPM_RC tpm2_try_take_ownership(void)
++{
++   TPM_RC status = TPM_SUCCESS;
++
++   tpm_AuthArea_ctor(NULL, 0, &vtpm_globals.pwAuth);
++
++   /* create SRK */
++   {
++      TPM2_CreatePrimary_Params_in in = {
++         .inSensitive = {
++            .size = 4,
++            .sensitive = {
++               .userAuth.size = 0,
++               .userAuth.buffer = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,\
++                                   0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++               .data.size = 0,
++            },
++         },
++         .inPublic = {
++            .size = 60,
++            .publicArea = {
++               .type = TPM2_ALG_RSA,
++               .nameAlg = TPM2_ALG_SHA256,
++#define SRK_OBJ_ATTR (fixedTPM | fixedParent  | userWithAuth |\
++                                    sensitiveDataOrigin | restricted | decrypt)
++               .objectAttributes = SRK_OBJ_ATTR,
++               .authPolicy.size = 0,
++               .parameters.rsaDetail = {
++                  .symmetric = {
++                     .algorithm = TPM2_ALG_AES,
++                        .keyBits.aes = AES_KEY_SIZES_BITS,
++                        .mode.aes = TPM2_ALG_CFB,
++                     },
++                     .scheme = { TPM2_ALG_NULL },
++                     .keyBits = RSA_KEY_SIZES_BITS,
++                     .exponent = 0,
++               },
++                  .unique.rsa.size = 0,
++            },
++         },
++         .outsideInfo.size = 0,
++         .creationPCR.count = 0,
++      };
++
++      TPMTRYRETURN(TPM2_CreatePrimary(TPM_RH_OWNER,\
++                                        &in,\
++                                        &vtpm_globals.srk_handle, NULL));
++
++      vtpmloginfo(VTPM_LOG_VTPM, "SRK handle: 0x%X\n", vtpm_globals.srk_handle);
++      {
++          const char data[20] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,\
++                                  0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
++          tpm_AuthArea_ctor(data, 20, &vtpm_globals.srk_AuthArea);
++      }
++   } /*end create SRK*/
++
++abort_egress:
++    return status;
++}
++
++static TPM_RESULT vtpmmgr2_create(void)
++{
++   TPM_RESULT status = TPM_SUCCESS;
++
++   TPMTRYRETURN(tpm2_try_take_ownership());
++
++   /* create SK */
++   {
++      TPM2_Create_Params_out out;
++      TPM2_Create_Params_in in = {
++         .inSensitive = {
++            .size = 4 + 20,
++            .sensitive = {
++               .userAuth.size = 20,
++               .userAuth.buffer = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,\
++                                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++               .data.size = 0,
++            },
++         },
++         .inPublic = {
++            .size = (60),
++            .publicArea = {
++               .type = TPM2_ALG_RSA,
++               .nameAlg = TPM2_ALG_SHA256,
++#define SK_OBJ_ATTR ( fixedTPM | fixedParent | userWithAuth \
++                                             |sensitiveDataOrigin |decrypt)
++               .objectAttributes = SK_OBJ_ATTR,
++               .authPolicy.size = 0,
++               .parameters.rsaDetail = {
++                  .symmetric = {
++                     .algorithm = TPM2_ALG_NULL,
++                  },
++                  .scheme = {
++                     TPM2_ALG_OAEP,
++                     .details.oaep.hashAlg = TPM2_ALG_SHA256,
++                  },
++                  .keyBits = RSA_KEY_SIZES_BITS,
++                  .exponent = 0,
++               },
++               .unique.rsa.size = 0,
++            },
++         },
++         .outsideInfo.size = 0,
++         .creationPCR.count = 0,
++      };/*end in */
++
++      TPMTRYRETURN(TPM2_Create(vtpm_globals.srk_handle,\
++								 &in,\
++								 &out));
++
++      TPMTRYRETURN(TPM2_Load(vtpm_globals.srk_handle,\
++							  &vtpm_globals.tpm2_storage_key.Private,\
++							  &vtpm_globals.tpm2_storage_key.Public,\
++							  &vtpm_globals.sk_handle, &vtpm_globals.sk_name));
++
++      vtpmloginfo(VTPM_LOG_VTPM, "SK HANDLE: 0x%X\n", vtpm_globals.sk_handle);
++
++   }/*end create SK*/
++
++   TPMTRYRETURN(vtpm2_storage_new_header());
++
++   goto egress;
++abort_egress:
++egress:
++   vtpmloginfo(VTPM_LOG_VTPM, "Finished initialized new VTPM manager\n");
++
++   return status;
++}
++
++TPM_RESULT vtpmmgr2_init(int argc, char** argv)
++{
++   TPM_RESULT status = TPM_SUCCESS;
++
++   /* Default commandline options */
++   struct Opts opts = {
++      .tpmdriver = TPMDRV_TPM_TIS,
++      .tpmiomem = TPM_BASEADDR,
++      .tpmirq = 0,
++      .tpmlocality = 0,
++      .gen_owner_auth = 0,
++   };
++
++   if(parse_cmdline_opts(argc, argv, &opts) != 0) {
++      vtpmlogerror(VTPM_LOG_VTPM, "Command line parsing failed! exiting..\n");
++      status = TPM_BAD_PARAMETER;
++      goto abort_egress;
++   }
++
++   /*Setup storage system*/
++   if(vtpm_storage_init() != 0) {
++      vtpmlogerror(VTPM_LOG_VTPM, "Unable to initialize storage subsystem!\n");
++      status = TPM_IOERROR;
++      goto abort_egress;
++   }
++
++   /*Setup tpmback device*/
++   init_tpmback(set_opaque_to_uuid, NULL);
++
++   /*Setup tpm access*/
++   switch(opts.tpmdriver) {
++      case TPMDRV_TPM_TIS:
++         {
++            struct tpm_chip* tpm;
++            if((tpm = init_tpm2_tis(opts.tpmiomem, TPM_TIS_LOCL_INT_TO_FLAG(opts.tpmlocality), opts.tpmirq)) == NULL) {
++               vtpmlogerror(VTPM_LOG_VTPM, "Unable to initialize tpmfront device\n");
++               status = TPM_IOERROR;
++               goto abort_egress;
++            }
++            vtpm_globals.tpm_fd = tpm_tis_open(tpm);
++            tpm_tis_request_locality(tpm, opts.tpmlocality);
++         }
++         break;
++      case TPMDRV_TPMFRONT:
++         {
++            struct tpmfront_dev* tpmfront_dev;
++            if((tpmfront_dev = init_tpmfront(NULL)) == NULL) {
++               vtpmlogerror(VTPM_LOG_VTPM, "Unable to initialize tpmfront device\n");
++               status = TPM_IOERROR;
++               goto abort_egress;
++            }
++            vtpm_globals.tpm_fd = tpmfront_open(tpmfront_dev);
++         }
++         break;
++
++   }
++
++   /* Blow away all stale handles left in the tpm*/
++   if(flush_tpm2() != TPM_SUCCESS) {
++      vtpmlogerror(VTPM_LOG_VTPM, "VTPM_FlushResources failed, continuing anyway..\n");
++   }
++
++   /* Initialize the rng */
++   entropy_init(&vtpm_globals.entropy);
++   entropy_add_source(&vtpm_globals.entropy, tpm_entropy_source, NULL, 0);
++   entropy_gather(&vtpm_globals.entropy);
++   ctr_drbg_init(&vtpm_globals.ctr_drbg, entropy_func, &vtpm_globals.entropy, NULL, 0);
++   ctr_drbg_set_prediction_resistance( &vtpm_globals.ctr_drbg, CTR_DRBG_PR_OFF );
++
++   /* Generate Auth for Owner*/
++   if(opts.gen_owner_auth) {
++      vtpmmgr_rand(vtpm_globals.owner_auth, sizeof(TPM_AUTHDATA));
++   }
++
++   /* Load the Manager data, if it fails create a new manager */
++   if (vtpm2_storage_load_header() != TPM_SUCCESS) {
++      vtpmloginfo(VTPM_LOG_VTPM, "Failed to read manager file. Assuming first time initialization.\n");
++      TPMTRYRETURN( vtpmmgr2_create() );
++   }
++
++   goto egress;
++abort_egress:
++   vtpmmgr_shutdown();
++egress:
++   return status;
++
++}
+diff --git a/stubdom/vtpmmgr/marshal.h b/stubdom/vtpmmgr/marshal.h
+index 77d32f0..372f9e7 100644
+--- a/stubdom/vtpmmgr/marshal.h
++++ b/stubdom/vtpmmgr/marshal.h
+@@ -41,6 +41,8 @@
+ #include <mini-os/byteorder.h>
+ #include <mini-os/endian.h>
+ #include "tcg.h"
++#include "tpm2_types.h"
++#include <assert.h>
+ 
+ typedef enum UnpackPtr {
+    UNPACK_ALIAS,
+@@ -525,4 +527,616 @@ inline BYTE* unpack_TPM_RQU_HEADER(BYTE* ptr,
+ #define pack_TPM_RSP_HEADER(p, t, s, r) pack_TPM_RQU_HEADER(p, t, s, r);
+ #define unpack_TPM_RSP_HEADER(p, t, s, r) unpack_TPM_RQU_HEADER(p, t, s, r);
+ 
++/* TPM 2.0 */
++#define pack_TPM_BUFFER(ptr, buf, size)	pack_BUFFER(ptr, buf, size)
++#define unpack_TPM_BUFFER(ptr, buf, size) unpack_BUFFER(ptr, buf, size)
++
++inline BYTE* pack_BYTE_ARRAY(BYTE* ptr, const BYTE* array, UINT32 size)
++{
++   int i;
++   for(i = 0; i < size; i++)
++      ptr = pack_BYTE(ptr, array[i]);
++   return ptr;
++}
++
++inline BYTE* pack_TPMA_SESSION(BYTE* ptr, const TPMA_SESSION *attr)
++{
++   return pack_BYTE(ptr, (BYTE)(*attr));
++}
++
++inline BYTE* unpack_TPMA_SESSION(BYTE* ptr, TPMA_SESSION *attr)
++{
++   return unpack_BYTE(ptr, (BYTE *)attr);
++}
++
++inline BYTE* pack_TPMI_ALG_HASH(BYTE* ptr, const TPMI_ALG_HASH *hash)
++{
++   return pack_UINT16(ptr, *hash);
++}
++
++inline BYTE* unpack_TPMI_ALG_HASH(BYTE *ptr, TPMI_ALG_HASH *hash)
++{
++   return unpack_UINT16(ptr, hash);
++}
++
++#define pack_TPMA_OBJECT(ptr, t)		pack_UINT32(ptr, (UINT32)(*t))
++#define unpack_TPMA_OBJECT(ptr, t)		unpack_UINT32(ptr, (UINT32 *)(t))
++#define pack_TPM_RH(ptr, t)				pack_UINT32(ptr, (UINT32)(*t))
++#define unpack_TPM_RH(ptr, t)			unpack_UINT32(ptr, (UINT32 *)(t))
++#define pack_TPMA_LOCALITY(ptr, locality)	pack_BYTE(ptr, (BYTE)*locality)
++#define unpack_TPMA_LOCALITY(ptr, locality)	unpack_BYTE(ptr, (BYTE *)locality)
++#define pack_TPM_ST(ptr, tag)			pack_UINT16(ptr, *tag)
++#define unpack_TPM_ST(ptr, tag)			unpack_UINT16(ptr, tag)
++#define pack_TPM_KEY_BITS(ptr, t)		pack_UINT16(ptr, *t)
++#define unpack_TPM_KEY_BITS(ptr, t)		unpack_UINT16(ptr, t)
++#define pack_TPMI_AES_KEY_BITS(ptr, t)	pack_TPM_KEY_BITS(ptr, t)
++#define unpack_TPMI_AES_KEY_BITS(ptr, t)	unpack_TPM_KEY_BITS(ptr, t)
++#define pack_TPMI_RSA_KEY_BITS(ptr, t)	pack_TPM_KEY_BITS(ptr, t)
++#define unpack_TPMI_RSA_KEY_BITS(ptr, t)	unpack_TPM_KEY_BITS(ptr, t)
++#define pack_TPM_ALG_ID(ptr, id)		pack_UINT16(ptr, *id)
++#define unpack_TPM_ALG_ID(ptr, id)		unpack_UINT16(ptr, id)
++#define pack_TPM_ALG_SYM(ptr, t)		pack_TPM_ALG_ID(ptr, t)
++#define unpack_TPM_ALG_SYM(ptr, t)		unpack_TPM_ALG_ID(ptr, t)
++#define pack_TPMI_ALG_ASYM(ptr, asym)		pack_TPM_ALG_ID(ptr, asym)
++#define unpack_TPMI_ALG_ASYM(ptr, asym)		unpack_TPM_ALG_ID(ptr, asym)
++#define pack_TPMI_ALG_SYM_OBJECT(ptr, t)	pack_TPM_ALG_ID(ptr, t)
++#define unpack_TPMI_ALG_SYM_OBJECT(ptr, t)	unpack_TPM_ALG_ID(ptr, t)
++#define pack_TPMI_ALG_SYM_MODE(ptr, t)		pack_TPM_ALG_ID(ptr, t)
++#define unpack_TPMI_ALG_SYM_MODE(ptr, t)	unpack_TPM_ALG_ID(ptr, t)
++#define pack_TPMI_ALG_KDF(ptr, t)		pack_TPM_ALG_ID(ptr, t)
++#define unpack_TPMI_ALG_KDF(ptr, t)		unpack_TPM_ALG_ID(ptr, t)
++#define pack_TPMI_ALG_PUBLIC(ptr, t)	pack_TPM_ALG_ID(ptr, t)
++#define unpack_TPMI_ALG_PUBLIC(ptr, t)	unpack_TPM_ALG_ID(ptr, t)
++#define pack_TPM2_HANDLE(ptr, h)			pack_UINT32(ptr, *h)
++#define unpack_TPM2_HANDLE(ptr, h)		unpack_UINT32(ptr, h)
++#define pack_TPMI_ALG_RSA_SCHEME(ptr, t)	pack_TPM_ALG_ID(ptr, t)
++#define unpack_TPMI_ALG_RSA_SCHEME(ptr, t)	unpack_TPM_ALG_ID(ptr, t)
++#define pack_TPMI_DH_OBJECT(ptr, o)		pack_TPM2_HANDLE(ptr, o)
++#define unpack_TPMI_DH_OBJECT(PTR, O)	unpack_TPM2_HANDLE(ptr, o)
++#define pack_TPMI_RH_HIERACHY(ptr, h)	pack_TPM2_HANDLE(ptr, h)
++#define unpack_TPMI_RH_HIERACHY(ptr, h)	unpack_TPM2_HANDLE(ptr, h)
++#define pack_TPMI_RH_PLATFORM(ptr, p)	pack_TPM2_HANDLE(ptr, p)
++#define unpack_TPMI_RH_PLATFORM(ptr, p)	unpack_TPM2_HANDLE(ptr, p)
++#define pack_TPMI_RH_OWNER(ptr, o)		pack_TPM2_HANDLE(ptr, o)
++#define unpack_TPMI_RH_OWNER(ptr, o)	unpack_TPM2_HANDLE(ptr, o)
++#define pack_TPMI_RH_ENDORSEMENT(ptr, e)	pack_TPM2_HANDLE(ptr, e)
++#define unpack_TPMI_RH_ENDORSEMENT(ptr, e)	unpack_TPM2_HANDLE(ptr, e)
++#define pack_TPMI_RH_LOCKOUT(ptr, l)	pack_TPM2_HANDLE(ptr, l)
++#define unpack_TPMI_RH_LOCKOUT(ptr, l)	unpack_TPM2_HANDLE(ptr, l)
++
++inline BYTE* pack_TPM2B_DIGEST(BYTE* ptr, const TPM2B_DIGEST *digest)
++{
++   ptr = pack_UINT16(ptr, digest->size);
++   ptr = pack_BUFFER(ptr, digest->buffer, digest->size);
++   return ptr;
++}
++
++inline BYTE* unpack_TPM2B_DIGEST(BYTE* ptr, TPM2B_DIGEST *digest)
++{
++   ptr = unpack_UINT16(ptr, &digest->size);
++   ptr = unpack_BUFFER(ptr, digest->buffer, digest->size); //sizeof(digest->buffer));
++   return ptr;
++}
++
++inline BYTE* pack_TPMT_TK_CREATION(BYTE* ptr,const TPMT_TK_CREATION *ticket )
++{
++   ptr = pack_TPM_ST(ptr , &ticket->tag);
++   ptr = pack_TPMI_RH_HIERACHY(ptr , &ticket->hierarchy);
++   ptr = pack_TPM2B_DIGEST(ptr, &ticket->digest);
++   return ptr;
++}
++
++inline BYTE* unpack_TPMT_TK_CREATION(BYTE* ptr, TPMT_TK_CREATION *ticket )
++{
++   ptr = unpack_TPM_ST(ptr, &ticket->tag);
++   ptr = unpack_TPMI_RH_HIERACHY(ptr, &ticket->hierarchy);
++   ptr = unpack_TPM2B_DIGEST(ptr, &ticket->digest);
++   return ptr;
++}
++
++inline BYTE* pack_TPM2B_NAME(BYTE* ptr,const TPM2B_NAME *name )
++{
++   ptr = pack_UINT16(ptr, name->size);
++   ptr = pack_TPM_BUFFER(ptr, name->name, name->size);
++   return ptr;
++}
++
++inline BYTE* unpack_TPM2B_NAME(BYTE* ptr, TPM2B_NAME *name)
++{
++   ptr = unpack_UINT16(ptr, &name->size);
++   ptr = unpack_TPM_BUFFER(ptr, name->name, name->size);
++   return ptr;
++}
++
++inline BYTE* pack_TPM2B_NONCE(BYTE* ptr, const TPM2B_NONCE *nonce)
++{
++   return pack_TPM2B_DIGEST(ptr, (const TPM2B_DIGEST*)nonce);
++}
++
++#define unpack_TPM2B_NONCE(ptr, nonce)	unpack_TPM2B_DIGEST(ptr, (TPM2B_DIGEST*)nonce)
++
++inline BYTE* pack_TPM2B_AUTH(BYTE* ptr, const TPM2B_AUTH *auth)
++{
++   return pack_TPM2B_DIGEST(ptr, (const TPM2B_DIGEST*)auth);
++}
++
++#define unpack_TPM2B_AUTH(ptr, auth)	unpack_TPM2B_DIGEST(ptr, (TPM2B_DIGEST*)auth)
++
++inline BYTE* pack_TPM2B_DATA(BYTE* ptr, const TPM2B_DATA *data)
++{
++   return pack_TPM2B_DIGEST(ptr, (const TPM2B_DIGEST*)data);
++}
++
++#define unpack_TPM2B_DATA(ptr, data)	unpack_TPM2B_DIGEST(ptr, (TPM2B_DIGEST*)data)
++
++inline BYTE* pack_TPM2B_SENSITIVE_DATA(BYTE* ptr, const TPM2B_SENSITIVE_DATA *data)
++{
++   return pack_TPM2B_DIGEST(ptr, (const TPM2B_DIGEST*)data);
++}
++
++#define unpack_TPM2B_SENSITIVE_DATA(ptr, data)	unpack_TPM2B_DIGEST(ptr, (TPM2B_DIGEST*)data)
++
++inline BYTE* pack_TPM2B_PUBLIC_KEY_RSA(BYTE* ptr, const TPM2B_PUBLIC_KEY_RSA *rsa)
++{
++   return pack_TPM2B_DIGEST(ptr, (const TPM2B_DIGEST*)rsa);
++}
++
++#define unpack_TPM2B_PUBLIC_KEY_RSA(ptr, rsa)	unpack_TPM2B_DIGEST(ptr, (TPM2B_DIGEST*)rsa)
++
++inline BYTE* pack_TPM2B_PRIVATE(BYTE* ptr, const TPM2B_PRIVATE *Private)
++{
++   ptr = pack_UINT16(ptr, Private->size);
++   ptr = pack_TPM_BUFFER(ptr, Private->buffer, Private->size);
++   return ptr;
++}
++
++inline BYTE* unpack_TPM2B_PRIVATE(BYTE* ptr, TPM2B_PRIVATE *Private)
++{
++   ptr = unpack_UINT16(ptr, &Private->size);
++   ptr = unpack_BUFFER(ptr, Private->buffer, Private->size);
++   return ptr;
++}
++
++inline BYTE* pack_TPMS_PCR_SELECTION_ARRAY(BYTE* ptr, const TPMS_PCR_SELECTION *sel, UINT32 count)
++{
++   int i;
++   for (i = 0; i < count; i++) {
++	   ptr = pack_TPMI_ALG_HASH(ptr, &sel[i].hash);
++	   ptr = pack_BYTE(ptr, sel[i].sizeofSelect);
++	   ptr = pack_BUFFER(ptr, sel[i].pcrSelect, sel[i].sizeofSelect);
++   }
++   return ptr;
++}
++
++inline BYTE* unpack_TPMS_PCR_SELECTION_ARRAY(BYTE* ptr, TPMS_PCR_SELECTION *sel, UINT32 count)
++{
++   int i;
++   for (i = 0; i < count; i++) {
++	   ptr = unpack_TPMI_ALG_HASH(ptr, &sel[i].hash);
++	   ptr = unpack_BYTE(ptr, &sel[i].sizeofSelect);
++	   ptr = unpack_BUFFER(ptr, sel[i].pcrSelect, sel[i].sizeofSelect);
++   }
++   return ptr;
++}
++
++inline BYTE* pack_TPML_PCR_SELECTION(BYTE* ptr, const TPML_PCR_SELECTION *sel)
++{
++   ptr = pack_UINT32(ptr, sel->count);
++   ptr = pack_TPMS_PCR_SELECTION_ARRAY(ptr, sel->pcrSelections, sel->count);
++   return ptr;
++}
++
++inline BYTE* unpack_TPML_PCR_SELECTION(BYTE* ptr, TPML_PCR_SELECTION *sel)
++{
++   ptr = unpack_UINT32(ptr, &sel->count);
++   ptr = unpack_TPMS_PCR_SELECTION_ARRAY(ptr, sel->pcrSelections, sel->count);
++   return ptr;
++}
++
++inline BYTE* unpack_TPML_DIGEST(BYTE* ptr,TPML_DIGEST *digest)
++{
++   int i;
++   ptr = unpack_UINT32(ptr, &digest->count);
++   for (i=0;i<digest->count;i++)
++   {
++	   ptr = unpack_TPM2B_DIGEST(ptr, &digest->digests[i]);
++   }
++   return ptr;
++}
++
++inline BYTE* pack_TPMS_CREATION_DATA(BYTE* ptr,const TPMS_CREATION_DATA *data)
++{
++   ptr = pack_TPML_PCR_SELECTION(ptr, &data->pcrSelect);
++   ptr = pack_TPM2B_DIGEST(ptr, &data->pcrDigest);
++   ptr = pack_TPMA_LOCALITY(ptr, &data->locality);
++   ptr = pack_TPM_ALG_ID(ptr, &data->parentNameAlg);
++   ptr = pack_TPM2B_NAME(ptr, &data->parentQualifiedName);
++   ptr = pack_TPM2B_DATA(ptr, &data->outsideInfo);
++   return ptr;
++}
++
++inline BYTE* unpack_TPMS_CREATION_DATA(BYTE* ptr, TPMS_CREATION_DATA *data)
++{
++   ptr = unpack_TPML_PCR_SELECTION(ptr, &data->pcrSelect);
++   ptr = unpack_TPM2B_DIGEST(ptr, &data->pcrDigest);
++   ptr = unpack_TPMA_LOCALITY(ptr, &data->locality);
++   ptr = unpack_TPM_ALG_ID(ptr, &data->parentNameAlg);
++   ptr = unpack_TPM2B_NAME(ptr, &data->parentName);
++   ptr = unpack_TPM2B_NAME(ptr, &data->parentQualifiedName);
++   ptr = unpack_TPM2B_DATA(ptr, &data->outsideInfo);
++   return ptr;
++}
++
++inline BYTE* pack_TPM2B_CREATION_DATA(BYTE* ptr, const TPM2B_CREATION_DATA *data )
++{
++   ptr = pack_UINT16(ptr, data->size);
++   ptr = pack_TPMS_CREATION_DATA(ptr, &data->creationData);
++   return ptr;
++}
++
++inline BYTE* unpack_TPM2B_CREATION_DATA(BYTE* ptr, TPM2B_CREATION_DATA * data)
++{
++   ptr = unpack_UINT16(ptr, &data->size);
++   ptr = unpack_TPMS_CREATION_DATA(ptr, &data->creationData);
++   return ptr;
++}
++
++inline BYTE* pack_TPMS_SENSITIVE_CREATE(BYTE* ptr, const TPMS_SENSITIVE_CREATE *create)
++{
++   ptr = pack_TPM2B_AUTH(ptr, &create->userAuth);
++   ptr = pack_TPM2B_SENSITIVE_DATA(ptr, &create->data);
++   return ptr;
++}
++
++inline BYTE* pack_TPM2B_SENSITIVE_CREATE(BYTE* ptr, const TPM2B_SENSITIVE_CREATE *create)
++{
++   BYTE* sizePtr = ptr;
++   ptr += 2;
++   ptr = pack_TPMS_SENSITIVE_CREATE(ptr, &create->sensitive);
++   pack_UINT16(sizePtr, (UINT16)(ptr - sizePtr - 2));
++   return ptr;
++}
++
++inline BYTE* pack_TPMU_SYM_MODE(BYTE* ptr, const TPMU_SYM_MODE *p, const TPMI_ALG_SYM_OBJECT *sel)
++{
++	switch(*sel) {
++		case TPM2_ALG_AES:
++			ptr = pack_TPMI_ALG_SYM_MODE(ptr, &p->aes);
++			break;
++		case TPM2_ALG_SM4:
++			assert(false);
++			break;
++		case TPM2_ALG_NULL:
++		case TPM2_ALG_XOR:
++			break;
++		default:
++			ptr = pack_TPMI_ALG_SYM_MODE(ptr, &p->sym);
++	}
++	return ptr;
++}
++inline BYTE* unpack_TPMU_SYM_MODE(BYTE* ptr, TPMU_SYM_MODE *p, const TPMI_ALG_SYM_OBJECT *sel)
++{
++	switch(*sel) {
++		case TPM2_ALG_AES:
++			ptr = unpack_TPMI_ALG_SYM_MODE(ptr, &p->aes);
++			break;
++		case TPM2_ALG_SM4:
++			assert(false);
++			break;
++		case TPM2_ALG_NULL:
++		case TPM2_ALG_XOR:
++			break;
++		default:
++			ptr = unpack_TPMI_ALG_SYM_MODE(ptr, &p->sym);
++	}
++	return ptr;
++}
++
++inline BYTE* pack_TPMU_SYM_KEY_BITS(BYTE* ptr, const TPMU_SYM_KEY_BITS *p, const TPMI_ALG_SYM_OBJECT *sel)
++{
++	switch(*sel) {
++		case TPM2_ALG_AES:
++			ptr = pack_TPMI_AES_KEY_BITS(ptr, &p->aes);
++			break;
++		case TPM2_ALG_SM4:
++			assert(false);
++			break;
++		case TPM2_ALG_XOR:
++		   assert(false);
++		   break;
++		case TPM2_ALG_NULL:
++		   break;
++		default:
++		   ptr = pack_TPM_KEY_BITS(ptr, &p->sym);
++   }
++   return ptr;
++}
++
++inline BYTE* unpack_TPMU_SYM_KEY_BITS(BYTE* ptr, TPMU_SYM_KEY_BITS *p, const TPMI_ALG_SYM_OBJECT *sel)
++{
++   switch(*sel) {
++	  case TPM2_ALG_AES:
++	     ptr = unpack_TPMI_AES_KEY_BITS(ptr, &p->aes);
++		 break;
++	  case TPM2_ALG_SM4:
++	     assert(false);
++		 break;
++	  case TPM2_ALG_XOR:
++	     assert(false);
++		 break;
++	  case TPM2_ALG_NULL:
++	     break;
++	  default:
++	     ptr = unpack_TPM_KEY_BITS(ptr, &p->sym);
++   }
++   return ptr;
++}
++
++inline BYTE* pack_TPMT_SYM_DEF_OBJECT(BYTE* ptr, const TPMT_SYM_DEF_OBJECT *p)
++{
++   ptr = pack_TPMI_ALG_SYM_OBJECT(ptr, &p->algorithm);
++   ptr = pack_TPMU_SYM_KEY_BITS(ptr, &p->keyBits, &p->algorithm);
++   ptr = pack_TPMU_SYM_MODE(ptr, &p->mode, &p->algorithm);
++   return ptr;
++}
++
++inline BYTE* unpack_TPMT_SYM_DEF_OBJECT(BYTE *ptr, TPMT_SYM_DEF_OBJECT *p)
++{
++   ptr = unpack_TPMI_ALG_SYM_OBJECT(ptr, &p->algorithm);
++   ptr = unpack_TPMU_SYM_KEY_BITS(ptr, &p->keyBits, &p->algorithm);
++   ptr = unpack_TPMU_SYM_MODE(ptr, &p->mode, &p->algorithm);
++   return ptr;
++}
++
++#define pack_TPMS_SCHEME_OAEP(p, t)		pack_TPMI_ALG_HASH(p, &((t)->hashAlg))
++#define unpack_TPMS_SCHEME_OAEP(p, t)	unpack_TPMI_ALG_HASH(p, &((t)->hashAlg))
++
++inline BYTE* pack_TPMU_ASYM_SCHEME(BYTE *ptr, const TPMU_ASYM_SCHEME *p, const TPMI_ALG_RSA_SCHEME *s)
++{
++	switch(*s) {
++#ifdef TPM2_ALG_RSASSA
++		case TPM2_ALG_RSASSA:
++			assert(false || "TPM2_ALG_RSASSA");
++			break;
++#endif
++#ifdef TPM2_ALG_OAEP
++		case TPM2_ALG_OAEP:
++			ptr = pack_TPMS_SCHEME_OAEP(ptr, &p->oaep);
++			break;
++#endif
++		case TPM2_ALG_NULL:
++			break;
++		default:
++			assert(false || "DEFAULT");
++	}
++	return ptr;
++}
++
++inline BYTE* unpack_TPMU_ASYM_SCHEME(BYTE *ptr, TPMU_ASYM_SCHEME *p, const TPMI_ALG_RSA_SCHEME *s)
++{
++   switch(*s) {
++#ifdef TPM2_ALG_RSASSA
++	  case TPM2_ALG_RSASSA:
++		 printf("not support TPM_ALG_RSASSA\n");
++		 assert(false);
++		 break;
++#endif
++#ifdef TPM2_ALG_OAEP
++	  case TPM2_ALG_OAEP:
++		 ptr = unpack_TPMS_SCHEME_OAEP(ptr, &p->oaep);
++		 break;
++#endif
++	  case TPM2_ALG_NULL:
++		 break;
++	  default:
++	     printf("default TPMI_ALG_RSA_SCHEME 0x%X\n", (UINT32)*s);
++		 ptr = unpack_TPMI_ALG_HASH(ptr, &p->anySig.hashAlg);
++   }
++   return ptr;
++}
++
++inline BYTE* pack_TPMT_RSA_SCHEME(BYTE* ptr, const TPMT_RSA_SCHEME *p)
++{
++   ptr = pack_TPMI_ALG_RSA_SCHEME(ptr, &p->scheme);
++   ptr = pack_TPMU_ASYM_SCHEME(ptr, &p->details, &p->scheme);
++   return ptr;
++}
++
++inline BYTE* unpack_TPMT_RSA_SCHEME(BYTE* ptr, TPMT_RSA_SCHEME *p)
++{
++	ptr = unpack_TPMI_ALG_RSA_SCHEME(ptr, &p->scheme);
++	ptr = unpack_TPMU_ASYM_SCHEME(ptr, &p->details, &p->scheme);
++	return ptr;
++}
++
++inline BYTE* pack_TPMT_RSA_DECRYPT(BYTE* ptr, const TPMT_RSA_DECRYPT *p)
++{
++   ptr = pack_TPMI_ALG_RSA_SCHEME(ptr, &p->scheme);
++   ptr = pack_TPMU_ASYM_SCHEME(ptr, &p->details, &p->scheme);
++   return ptr;
++}
++
++inline BYTE* pack_TPMS_RSA_PARMS(BYTE* ptr, const TPMS_RSA_PARMS *p)
++{
++   ptr = pack_TPMT_SYM_DEF_OBJECT(ptr, &p->symmetric);
++   ptr = pack_TPMT_RSA_SCHEME(ptr, &p->scheme);
++   ptr = pack_TPMI_RSA_KEY_BITS(ptr, &p->keyBits);
++   ptr = pack_UINT32(ptr, p->exponent);
++   return ptr;
++}
++
++inline BYTE* unpack_TPMS_RSA_PARMS(BYTE *ptr, TPMS_RSA_PARMS *p)
++{
++   ptr = unpack_TPMT_SYM_DEF_OBJECT(ptr, &p->symmetric);
++   ptr = unpack_TPMT_RSA_SCHEME(ptr, &p->scheme);
++   ptr = unpack_TPMI_RSA_KEY_BITS(ptr, &p->keyBits);
++   ptr = unpack_UINT32(ptr, &p->exponent);
++   return ptr;
++}
++
++inline BYTE* pack_TPMU_PUBLIC_PARMS(BYTE* ptr, const TPMU_PUBLIC_PARMS *param, const TPMI_ALG_PUBLIC *selector)
++{
++   switch(*selector) {
++	   case TPM2_ALG_KEYEDHASH:
++		   assert(false);
++	   case TPM2_ALG_SYMCIPHER:
++		   assert(false);
++	   case TPM2_ALG_RSA:
++		   return pack_TPMS_RSA_PARMS(ptr, &param->rsaDetail);
++	   case TPM2_ALG_ECC:
++		   assert(false);
++   }
++   assert(false);
++   return NULL;
++}
++
++inline BYTE* unpack_TPMU_PUBLIC_PARMS(BYTE* ptr, TPMU_PUBLIC_PARMS *param, const TPMI_ALG_PUBLIC *selector)
++{
++   switch(*selector) {
++	  case TPM2_ALG_KEYEDHASH:
++		  assert(false);
++	  case TPM2_ALG_SYMCIPHER:
++		  assert(false);
++	  case TPM2_ALG_RSA:
++		  return unpack_TPMS_RSA_PARMS(ptr, &param->rsaDetail);
++	  case TPM2_ALG_ECC:
++		  assert(false);
++}
++assert(false);
++return NULL;
++}
++
++inline BYTE* pack_TPMS_ECC_POINT(BYTE* ptr, const TPMS_ECC_POINT *point)
++{
++   assert(false);
++   return ptr;
++}
++
++inline BYTE* unpack_TPMS_ECC_POINT(BYTE* ptr, TPMS_ECC_POINT *point)
++{
++   assert(false);
++   return ptr;
++}
++
++inline BYTE* pack_TPMU_PUBLIC_ID(BYTE* ptr, const TPMU_PUBLIC_ID *id, const TPMI_ALG_PUBLIC *selector)
++{
++   switch (*selector) {
++	   case TPM2_ALG_KEYEDHASH:
++		   return pack_TPM2B_DIGEST(ptr, &id->keyedHash);
++	   case TPM2_ALG_SYMCIPHER:
++		   return pack_TPM2B_DIGEST(ptr, &id->sym);
++	   case TPM2_ALG_RSA:
++		   return pack_TPM2B_PUBLIC_KEY_RSA(ptr, &id->rsa);
++	   case TPM2_ALG_ECC:
++		   return pack_TPMS_ECC_POINT(ptr, &id->ecc);
++}
++assert(false);
++return NULL;
++}
++
++inline BYTE* unpack_TPMU_PUBLIC_ID(BYTE* ptr, TPMU_PUBLIC_ID *id, TPMI_ALG_PUBLIC *selector)
++{
++   switch (*selector) {
++	  case TPM2_ALG_KEYEDHASH:
++		  return unpack_TPM2B_DIGEST(ptr, &id->keyedHash);
++	  case TPM2_ALG_SYMCIPHER:
++		  return unpack_TPM2B_DIGEST(ptr, &id->sym);
++	  case TPM2_ALG_RSA:
++		  return unpack_TPM2B_PUBLIC_KEY_RSA(ptr, &id->rsa);
++	  case TPM2_ALG_ECC:
++		  return unpack_TPMS_ECC_POINT(ptr, &id->ecc);
++}
++assert(false);
++return NULL;
++}
++
++inline BYTE* pack_TPMT_PUBLIC(BYTE* ptr, const TPMT_PUBLIC *public)
++{
++   ptr = pack_TPMI_ALG_PUBLIC(ptr, &public->type);
++   ptr = pack_TPMI_ALG_HASH(ptr, &public->nameAlg);
++   ptr = pack_TPMA_OBJECT(ptr, &public->objectAttributes);
++   ptr = pack_TPM2B_DIGEST(ptr, &public->authPolicy);
++   ptr = pack_TPMU_PUBLIC_PARMS(ptr, &public->parameters, &public->type);
++   ptr = pack_TPMU_PUBLIC_ID(ptr, &public->unique, &public->type);
++   return ptr;
++}
++
++inline BYTE* unpack_TPMT_PUBLIC(BYTE* ptr, TPMT_PUBLIC *public)
++{
++   ptr = unpack_TPMI_ALG_PUBLIC(ptr, &public->type);
++   ptr = unpack_TPMI_ALG_HASH(ptr, &public->nameAlg);
++   ptr = unpack_TPMA_OBJECT(ptr, &public->objectAttributes);
++   ptr = unpack_TPM2B_DIGEST(ptr, &public->authPolicy);
++   ptr = unpack_TPMU_PUBLIC_PARMS(ptr, &public->parameters, &public->type);
++   ptr = unpack_TPMU_PUBLIC_ID(ptr, &public->unique, &public->type);
++   return ptr;
++}
++
++inline BYTE* pack_TPM2B_PUBLIC(BYTE* ptr, const TPM2B_PUBLIC *public)
++{
++   BYTE *sizePtr = ptr;
++   ptr += 2;
++   ptr = pack_TPMT_PUBLIC(ptr, &public->publicArea);
++   pack_UINT16(sizePtr, (UINT16)(ptr - sizePtr - 2));
++   return ptr;
++}
++
++inline BYTE* unpack_TPM2B_PUBLIC(BYTE* ptr, TPM2B_PUBLIC *public)
++{
++   ptr = unpack_UINT16(ptr, &public->size);
++   ptr = unpack_TPMT_PUBLIC(ptr, &public->publicArea);
++   return ptr;
++}
++
++inline BYTE* pack_TPMS_PCR_SELECTION(BYTE* ptr, const TPMS_PCR_SELECTION *selection)
++{
++   ptr = pack_TPMI_ALG_HASH(ptr, &selection->hash);
++   ptr = pack_BYTE(ptr, selection->sizeofSelect);
++   ptr = pack_BYTE_ARRAY(ptr, selection->pcrSelect, selection->sizeofSelect);
++   return ptr;
++}
++
++inline BYTE* pack_TPMS_PCR_SELECTION_Array(BYTE* ptr, const TPMS_PCR_SELECTION *selections, const UINT32 cnt)
++{
++   int i;
++   for (i = 0; i < cnt; i++)
++	  ptr = pack_TPMS_PCR_SELECTION(ptr, selections + i);
++   return ptr;
++}
++
++inline BYTE* pack_TPM_AuthArea(BYTE* ptr, const TPM_AuthArea *auth)
++{
++   BYTE* sizePtr = ptr;
++   ptr += sizeof(UINT32);
++   ptr = pack_TPM_RH(ptr, &auth->sessionHandle);
++   ptr = pack_TPM2B_NONCE(ptr, &auth->nonce);
++   ptr = pack_TPMA_SESSION(ptr, &auth->sessionAttributes);
++   ptr = pack_TPM2B_AUTH(ptr, &auth->auth);
++   pack_UINT32(sizePtr, ptr - sizePtr - sizeof(UINT32));
++   return ptr;
++}
++
++inline BYTE* unpack_TPM_AuthArea(BYTE* ptr, TPM_AuthArea *auth)
++{
++   ptr = unpack_UINT32(ptr, &auth->size);
++   ptr = unpack_TPM_RH(ptr, &auth->sessionHandle);
++   ptr = unpack_TPM2B_NONCE(ptr, &auth->nonce);
++   ptr = unpack_TPMA_SESSION(ptr, &auth->sessionAttributes);
++   ptr = unpack_TPM2B_AUTH(ptr, &auth->auth);
++   return ptr;
++}
++
++inline BYTE* pack_TPM2_RSA_KEY(BYTE* ptr, const TPM2_RSA_KEY *key)
++{
++   ptr = pack_TPM2B_PRIVATE(ptr, &key->Private);
++   ptr = pack_TPM2B_PUBLIC(ptr, &key->Public);
++   return ptr;
++}
++
++inline BYTE* unpack_TPM2_RSA_KEY(BYTE* ptr, TPM2_RSA_KEY *key)
++{
++   ptr = unpack_TPM2B_PRIVATE(ptr, &key->Private);
++   ptr = unpack_TPM2B_PUBLIC(ptr, &key->Public);
++   return ptr;
++}
+ #endif
+diff --git a/stubdom/vtpmmgr/tpm.c b/stubdom/vtpmmgr/tpm.c
+index 123a27c..a42f37a 100644
+--- a/stubdom/vtpmmgr/tpm.c
++++ b/stubdom/vtpmmgr/tpm.c
+@@ -122,7 +122,7 @@ sha1_starts(&sha1_ctx)
+    ptr = out_buf;\
+    ptr = unpack_TPM_RSP_HEADER(ptr, \
+          &(tag), &(paramSize), &(status));\
+-   if((status) != TPM_SUCCESS || (tag) != (intag +3)) { \
++   if((status) != TPM_SUCCESS){ \
+       vtpmlogerror(VTPM_LOG_TPM, "Failed with return code %s\n", tpm_get_error_name(status));\
+       goto abort_egress;\
+    }\
+@@ -739,29 +739,6 @@ abort_egress:
+    return status;
+ }
+ 
+-TPM_RESULT TPM_GetRandom( UINT32*    bytesRequested, // in, out
+-      BYTE*    randomBytes) // out
+-{
+-   TPM_BEGIN(TPM_TAG_RQU_COMMAND, TPM_ORD_GetRandom);
+-
+-   // check input params
+-   if (bytesRequested == NULL || randomBytes == NULL){
+-      return TPM_BAD_PARAMETER;
+-   }
+-
+-   ptr = pack_UINT32(ptr, *bytesRequested);
+-
+-   TPM_TRANSMIT();
+-   TPM_UNPACK_VERIFY();
+-
+-   ptr = unpack_UINT32(ptr, bytesRequested);
+-   ptr = unpack_BUFFER(ptr, randomBytes, *bytesRequested);
+-
+-abort_egress:
+-   return status;
+-}
+-
+-
+ TPM_RESULT TPM_ReadPubek(
+       TPM_PUBKEY* pubEK //out
+       )
+@@ -936,3 +913,320 @@ abort_egress:
+ egress:
+    return status;
+ }
++
++/*TPM 2.0*/
++
++TPM_RC TPM2_PCR_Read(TPML_PCR_SELECTION pcrSelectionIn, \
++					UINT32 *pcrUpdateCounter,\
++					TPML_PCR_SELECTION *pcrSelectionOut,\
++					TPML_DIGEST *pcrValues)
++{
++   TPM_BEGIN(TPM_ST_NO_SESSIONS,TPM_CC_PCR_Read);
++
++   /*pack in*/
++   ptr =  pack_TPML_PCR_SELECTION(ptr, &pcrSelectionIn);
++
++   TPM_TRANSMIT();
++   TPM_UNPACK_VERIFY();
++
++   /*unpack out*/
++   ptr = unpack_UINT32(ptr, pcrUpdateCounter);
++   ptr = unpack_TPML_PCR_SELECTION(ptr, pcrSelectionOut);
++   ptr = unpack_TPML_DIGEST(ptr, pcrValues);
++
++   goto egress;
++abort_egress:
++egress:
++   return status;
++}
++
++TPM_RC TPM2_Load(TPMI_DH_OBJECT parentHandle, \
++						TPM2B_PRIVATE *inPrivate, /* in */ \
++						TPM2B_PUBLIC *inPublic, /* in */ \
++						TPM_HANDLE *objectHandle, /* out */\
++						TPM2B_NAME *name /* out */)
++{
++   TPM_BEGIN(TPM_ST_SESSIONS, TPM_CC_Load);
++
++   /* pack handle of parent for new object */
++   ptr =  pack_UINT32(ptr, parentHandle);
++
++   ptr = pack_TPM_AuthArea(ptr, &vtpm_globals.srk_AuthArea);
++   ptr = pack_TPM2B_PRIVATE(ptr, inPrivate);
++   ptr = pack_TPM2B_PUBLIC(ptr, inPublic);
++
++   TPM_TRANSMIT();
++   TPM_UNPACK_VERIFY();
++
++   if (objectHandle != NULL) {
++	   ptr = unpack_TPM_HANDLE(ptr, objectHandle);
++   } else {
++	   TPM_HANDLE tmp;
++	   ptr = unpack_TPM_HANDLE(ptr, &tmp);
++   }
++
++   if (name != NULL)
++	   ptr = unpack_TPM2B_NAME(ptr, name);
++   goto egress;
++
++abort_egress:
++
++egress:
++   return status;
++}
++
++TPM_RC TPM2_Create(TPMI_DH_OBJECT parentHandle, \
++						TPM2_Create_Params_in *in, \
++						TPM2_Create_Params_out *out)
++{
++   UINT32 param_size;
++   TPM_BEGIN(TPM_ST_SESSIONS, TPM_CC_Create);
++
++   /* pack handle of parent for new object */
++   ptr =  pack_UINT32(ptr, parentHandle);
++
++   /* pack Auth Area */
++   ptr = pack_TPM_AuthArea(ptr, &vtpm_globals.srk_AuthArea);
++
++   /* pack inSensitive */
++   ptr = pack_TPM2B_SENSITIVE_CREATE(ptr, &in->inSensitive);
++
++   /* pack inPublic */
++   ptr = pack_TPM2B_PUBLIC(ptr, &in->inPublic);
++
++   /* pack outside Info */
++   ptr = pack_TPM2B_DATA(ptr, &in->outsideInfo);
++
++   /* pack createPCR */
++   ptr = pack_TPML_PCR_SELECTION(ptr, &in->creationPCR);
++
++   /* Send the command to the tpm */
++   TPM_TRANSMIT();
++
++   /* Unpack and validate the header */
++   TPM_UNPACK_VERIFY();
++
++   ptr = unpack_UINT32(ptr, &param_size);
++   if (out != NULL) {
++	   ptr = unpack_TPM2B_PRIVATE(ptr, &vtpm_globals.tpm2_storage_key.Private);
++	   ptr = unpack_TPM2B_PUBLIC(ptr, &vtpm_globals.tpm2_storage_key.Public);
++	   ptr = unpack_TPM2B_CREATION_DATA(ptr, &out->creationData);
++	   ptr = unpack_TPM2B_DIGEST(ptr, &out->creationHash);
++	   ptr = unpack_TPMT_TK_CREATION(ptr, &out->creationTicket);
++   } else
++	   ptr += param_size;
++
++   goto egress;
++
++abort_egress:
++
++egress:
++	return status;
++}
++
++TPM_RC TPM2_CreatePrimary(TPMI_RH_HIERARCHY primaryHandle, \
++							TPM2_Create_Params_in *in, \
++							TPM_HANDLE *objHandle, \
++							TPM2_Create_Params_out *out)
++{
++	UINT32 param_size;
++	TPM_BEGIN(TPM_ST_SESSIONS, TPM_CC_CreatePrimary);
++
++	/* pack primary handle */
++	ptr = pack_UINT32(ptr, primaryHandle);
++
++	/* pack Auth Area */
++	ptr = pack_TPM_AuthArea(ptr, &vtpm_globals.pwAuth);
++
++	/* pack inSenstive */
++	ptr = pack_TPM2B_SENSITIVE_CREATE(ptr, &in->inSensitive);
++
++	/* pack inPublic */
++	ptr = pack_TPM2B_PUBLIC(ptr, &in->inPublic);
++
++	/* pack outsideInfo */
++	ptr = pack_TPM2B_DATA(ptr, &in->outsideInfo);
++
++	/* pack creationPCR */
++	ptr = pack_TPML_PCR_SELECTION(ptr, &in->creationPCR);
++
++	/* Send the command to the tpm */
++	TPM_TRANSMIT();
++
++	/* Unpack and validate the header */
++	TPM_UNPACK_VERIFY();
++
++	if (objHandle != NULL)
++		ptr = unpack_TPM_HANDLE(ptr, objHandle);
++	else {
++		TPM_HANDLE handle;
++		ptr = unpack_TPM_HANDLE(ptr, &handle);
++	}
++	ptr = unpack_UINT32(ptr, &param_size);
++
++	if (out != NULL) {
++		ptr = unpack_TPM2B_PUBLIC(ptr, &out->outPublic);
++		ptr = unpack_TPM2B_CREATION_DATA(ptr, &out->creationData);
++		ptr = unpack_TPM2B_DIGEST(ptr, &out->creationHash);
++		ptr = unpack_TPMT_TK_CREATION(ptr, &out->creationTicket);
++	} else
++		ptr += param_size;
++
++	goto egress;
++
++abort_egress:
++
++egress:
++   return status;
++}
++
++TPM_RC TPM2_HierachyChangeAuth(TPMI_RH_HIERARCHY_AUTH authHandle, TPM2B_AUTH *newAuth)
++{
++   TPM_BEGIN(TPM_ST_SESSIONS, TPM_CC_HierarchyChangeAuth);
++   ptr = pack_UINT32(ptr, authHandle);
++   ptr = pack_TPM_AuthArea(ptr, &vtpm_globals.pwAuth);
++   ptr = pack_TPM2B_AUTH(ptr, newAuth);
++   TPM_TRANSMIT();
++
++   TPM_UNPACK_VERIFY();
++
++abort_egress:
++   return status;
++}
++
++TPM_RC TPM2_RSA_ENCRYPT(TPMI_DH_OBJECT keyHandle,
++							TPM2B_PUBLIC_KEY_RSA *message,
++							TPMT_RSA_DECRYPT *inScheme,
++							TPM2B_DATA *label,
++							TPM2B_PUBLIC_KEY_RSA *outData)
++{
++   TPM_BEGIN(TPM_ST_NO_SESSIONS, TPM_CC_RSA_Encrypt);
++
++   ptr = pack_UINT32(ptr, keyHandle);
++   ptr = pack_TPM2B_PUBLIC_KEY_RSA(ptr, message);
++   ptr = pack_TPMT_RSA_DECRYPT(ptr, inScheme);
++   ptr = pack_TPM2B_DATA(ptr, label);
++
++   TPM_TRANSMIT();
++   TPM_UNPACK_VERIFY();
++
++   if (outData != NULL)
++	   unpack_TPM2B_PUBLIC_KEY_RSA(ptr, outData);
++abort_egress:
++	return status;
++}
++
++TPM_RC TPM2_Bind(TPMI_DH_OBJECT keyHandle,
++					const BYTE *keybuf,
++					UINT32 keylen,
++					BYTE *out)
++{
++   TPM_RC status = TPM_SUCCESS;
++   TPM2B_PUBLIC_KEY_RSA message;
++   TPMT_RSA_DECRYPT inScheme;
++   TPM2B_DATA label;
++   TPM2B_PUBLIC_KEY_RSA outData;
++
++   message.size = keylen;
++   memcpy(message.buffer, keybuf, keylen);
++   inScheme.scheme = TPM2_ALG_NULL;
++   label.size = 0;
++   TPMTRYRETURN(TPM2_RSA_ENCRYPT(keyHandle, &message, &inScheme, &label, &outData));
++   memcpy(out, outData.buffer, outData.size);
++
++abort_egress:
++	return status;
++}
++
++TPM_RC TPM2_RSA_Decrypt(TPMI_DH_OBJECT keyHandle, \
++					   TPM2B_PUBLIC_KEY_RSA *cipherText, \
++					   TPMT_RSA_DECRYPT *inScheme, \
++					   TPM2B_DATA *label, \
++					   TPM2B_PUBLIC_KEY_RSA *message)
++{
++   UINT32 param_size;
++
++   TPM_BEGIN(TPM_ST_SESSIONS, TPM_CC_RSA_Decrypt);
++
++   ptr = pack_UINT32(ptr, keyHandle);
++   ptr = pack_TPM_AuthArea(ptr, &vtpm_globals.srk_AuthArea);
++   ptr = pack_TPM2B_PUBLIC_KEY_RSA(ptr, cipherText);
++   ptr = pack_TPMT_RSA_DECRYPT(ptr, inScheme);
++   ptr = pack_TPM2B_DATA(ptr, label);
++
++   TPM_TRANSMIT();
++   TPM_UNPACK_VERIFY();
++
++   ptr = unpack_UINT32(ptr, &param_size);
++
++   if (message)
++	   ptr = unpack_TPM2B_PUBLIC_KEY_RSA(ptr, message);
++abort_egress:
++   return status;
++}
++
++TPM_RC TPM2_UnBind(TPMI_DH_OBJECT keyHandle,
++					UINT32 ilen,
++					BYTE *in,
++					UINT32 *olen,
++					BYTE *out)
++{
++   UINT32 status;
++   TPM2B_PUBLIC_KEY_RSA cipher, message;
++   TPMT_RSA_DECRYPT inScheme;
++   TPM2B_DATA label;
++
++   cipher.size = ilen;
++   memcpy(cipher.buffer, in, ilen);
++   inScheme.scheme = TPM2_ALG_NULL;
++   label.size = 0;
++
++   TPMTRYRETURN(TPM2_RSA_Decrypt(keyHandle, &cipher, &inScheme, &label, &message));
++
++   *olen = message.size;
++   memcpy(out, message.buffer, *olen);
++abort_egress:
++   return status;
++}
++
++TPM_RC TPM2_CLEAR(void)
++{
++   TPM_BEGIN(TPM_ST_SESSIONS, TPM_CC_Clear);
++
++   ptr = pack_UINT32(ptr, TPM_RH_PLATFORM);
++   ptr = pack_TPM_AuthArea(ptr, &vtpm_globals.pwAuth);
++
++   TPM_TRANSMIT();
++   TPM_UNPACK_VERIFY();
++
++abort_egress:
++	return status;
++}
++
++TPM_RC TPM_GetRandom (UINT32 * bytesRequested, BYTE * randomBytes)
++{
++   TPM_BEGIN(TPM_ST_NO_SESSIONS, TPM_CC_GetRandom);
++
++   ptr = pack_UINT16(ptr, (UINT16)*bytesRequested);
++
++   TPM_TRANSMIT();
++   TPM_UNPACK_VERIFY();
++
++   ptr = unpack_UINT16(ptr, (UINT16 *)bytesRequested);
++   ptr = unpack_TPM_BUFFER(ptr, randomBytes, *bytesRequested);
++abort_egress:
++   return status;
++}
++
++TPM_RC TPM2_FlushContext(TPMI_DH_CONTEXT flushHandle)
++{
++   TPM_BEGIN(TPM_ST_NO_SESSIONS, TPM_CC_FlushContext);
++
++   ptr = pack_UINT32(ptr, flushHandle);
++
++   TPM_TRANSMIT();
++   TPM_UNPACK_VERIFY();
++
++abort_egress:
++   return status;
++}
+diff --git a/stubdom/vtpmmgr/tpm.h b/stubdom/vtpmmgr/tpm.h
+index 304e145..45a24ad 100644
+--- a/stubdom/vtpmmgr/tpm.h
++++ b/stubdom/vtpmmgr/tpm.h
+@@ -38,6 +38,7 @@
+ #define __TPM_H__
+ 
+ #include "tcg.h"
++#include "tpm2_types.h"
+ 
+ // ------------------------------------------------------------------
+ // Exposed API
+@@ -215,4 +216,63 @@ TPM_RESULT TPM_TransmitData(
+       BYTE* out,
+       UINT32* outsize);
+ 
++/* TPM2.0 */
++TPM_RC TPM2_PCR_Read(
++	  TPML_PCR_SELECTION pcrSelectionIn,
++	  UINT32 *pcrUpdateCounter,
++	  TPML_PCR_SELECTION *pcrSelectionOut,
++	  TPML_DIGEST *pcrValues);
++
++TPM_RC TPM2_Load(
++	  TPMI_DH_OBJECT parentHandle,
++	  TPM2B_PRIVATE *inPrivate,
++	  TPM2B_PUBLIC *inPublic,
++	  TPM_HANDLE *objectHandle,
++	  TPM2B_NAME *name);
++
++TPM_RC TPM2_Create(
++	  TPMI_DH_OBJECT parentHandle,
++	  TPM2_Create_Params_in *in,
++	  TPM2_Create_Params_out *out);
++
++TPM_RC TPM2_CreatePrimary(
++	  TPMI_RH_HIERARCHY primaryHandle,
++	  TPM2_Create_Params_in *objHandle,
++	  TPM_HANDLE *in,
++	  TPM2_Create_Params_out *out);
++
++TPM_RC TPM2_HierachyChangeAuth(
++	  TPMI_RH_HIERARCHY_AUTH authHandle,
++	  TPM2B_AUTH *newAuth);
++
++TPM_RC TPM2_RSA_ENCRYPT(
++	  TPMI_DH_OBJECT keyHandle,
++	  TPM2B_PUBLIC_KEY_RSA *message,
++	  TPMT_RSA_DECRYPT *inScheme,
++	  TPM2B_DATA *label,
++	  TPM2B_PUBLIC_KEY_RSA *outData);
++
++TPM_RC TPM2_Bind(
++	  TPMI_DH_OBJECT keyHandle,
++	  const BYTE *keybuf,
++	  UINT32 keylen,
++	  BYTE *out);
++
++TPM_RC TPM2_RSA_Decrypt(
++	  TPMI_DH_OBJECT keyHandle,
++	  TPM2B_PUBLIC_KEY_RSA *cipherText,
++	  TPMT_RSA_DECRYPT *inScheme,
++	  TPM2B_DATA *label,
++	  TPM2B_PUBLIC_KEY_RSA *message);
++
++TPM_RC TPM2_UnBind(
++	  TPMI_DH_OBJECT keyHandle,
++	  UINT32 ilen,
++	  BYTE *in,
++	  UINT32 *olen,
++	  BYTE *out);
++
++TPM_RC TPM2_CLEAR(void);
++
++TPM_RC TPM2_FlushContext(TPMI_DH_CONTEXT);
+ #endif //TPM_H
+diff --git a/stubdom/vtpmmgr/vtpm_cmd_handler.c b/stubdom/vtpmmgr/vtpm_cmd_handler.c
+index f82a2a9..b15ed01 100644
+--- a/stubdom/vtpmmgr/vtpm_cmd_handler.c
++++ b/stubdom/vtpmmgr/vtpm_cmd_handler.c
+@@ -150,3 +150,150 @@ abort_egress:
+ 
+    return status;
+ }
++
++/* TPM 2.0 */
++
++static TPM_RESULT vtpmmgr2_SaveHashKey(
++      const uuid_t uuid,
++      tpmcmd_t* tpmcmd)
++{
++   TPM_RESULT status = TPM_SUCCESS;
++
++   if(tpmcmd->req_len != VTPM_COMMAND_HEADER_SIZE + HASHKEYSZ) {
++      vtpmlogerror(VTPM_LOG_VTPM, "VTPM_ORD_SAVEHASHKEY hashkey too short!\n");
++      status = TPM_BAD_PARAMETER;
++      goto abort_egress;
++   }
++
++   /* Do the command */
++   TPMTRYRETURN(vtpm2_storage_save_hashkey(uuid, tpmcmd->req + VTPM_COMMAND_HEADER_SIZE));
++
++abort_egress:
++   pack_TPM_RSP_HEADER(tpmcmd->resp,VTPM_TAG_RSP, VTPM_COMMAND_HEADER_SIZE, status);
++   tpmcmd->resp_len = VTPM_COMMAND_HEADER_SIZE;
++
++   return status;
++}
++
++static TPM_RESULT vtpmmgr2_LoadHashKey(const uuid_t uuid,tpmcmd_t* tpmcmd)
++{
++   TPM_RESULT status = TPM_SUCCESS;
++
++   tpmcmd->resp_len = VTPM_COMMAND_HEADER_SIZE;
++
++   TPMTRYRETURN(vtpm2_storage_load_hashkey(uuid, tpmcmd->resp + VTPM_COMMAND_HEADER_SIZE));
++
++   tpmcmd->resp_len += HASHKEYSZ;
++
++abort_egress:
++   pack_TPM_RSP_HEADER(tpmcmd->resp,VTPM_TAG_RSP, tpmcmd->resp_len, status);
++
++   return status;
++}
++
++TPM_RESULT vtpmmgr2_handle_cmd(
++      const uuid_t uuid,
++      tpmcmd_t* tpmcmd)
++{
++   TPM_RESULT status = TPM_SUCCESS;
++   TPM_TAG tag;
++   UINT32 size;
++   TPM_COMMAND_CODE ord;
++
++   unpack_TPM_RQU_HEADER(tpmcmd->req,&tag, &size, &ord);
++    printf("VTPM COMMAND RECIEVED: 0x%X, 0x%X, 0x%X\n", tag, size, ord);
++
++   /* Handle the command now */
++   switch(tag) {
++      case VTPM_TAG_REQ:
++         /*This is a vTPM command*/
++         switch(ord) {
++            case VTPM_ORD_SAVEHASHKEY:
++               return vtpmmgr2_SaveHashKey(uuid, tpmcmd);
++            case VTPM_ORD_LOADHASHKEY:
++               return vtpmmgr2_LoadHashKey(uuid, tpmcmd);
++            default:
++               vtpmlogerror(VTPM_LOG_VTPM, "Invalid vTPM Ordinal %" PRIu32 "\n", ord);
++               status = TPM_BAD_ORDINAL;
++         }
++         break;
++      case TPM_TAG_RQU_COMMAND:
++      case TPM_TAG_RQU_AUTH1_COMMAND:
++      case TPM_TAG_RQU_AUTH2_COMMAND:
++//This is a TPM passthrough command
++         switch(ord) {
++            case TPM_ORD_GetRandom:
++                {
++                    BYTE *ptr = tpmcmd->resp;
++					UINT32 bytesRequested = be32_to_cpu(*(UINT32 *)(tpmcmd->req + 10));
++                    vtpmloginfo(VTPM_LOG_VTPM, "Passthrough: TPM_GetRandom\n");
++                    TPMTRYRETURN(TPM_GetRandom(&bytesRequested, ptr+14));
++                    *(UINT16 *)ptr = (TPM_TAG_RSP_COMMAND);
++                    *(UINT32 *)(ptr + 2) = (14 + bytesRequested);
++                    *(UINT32 *)(ptr + 6) = (status);
++                    *(UINT32 *)(ptr + 10) = cpu_to_be32(bytesRequested);
++                    tpmcmd->resp_len = *(ptr + 2);
++
++					return status;
++                }
++                    case TPM_ORD_PcrRead:
++                {
++                    BYTE    *ptr = tpmcmd->resp;
++                    UINT32  index = be32_to_cpu(*(UINT32 *)(tpmcmd->req + 10));
++                    TPML_PCR_SELECTION  pcrSelectionIn;
++                    UINT32  pcrUpdateCounter = 0;
++                    TPML_PCR_SELECTION pcrSelectionOut;
++                    TPML_DIGEST pcrValues;
++                    UINT8   sizeofSelect = (UINT8)index/8;
++                    BYTE    pcrSelect = (BYTE)index%8;
++                    int     i;
++
++                    pcrValues.count = 0;
++                    pcrSelectionIn.count = 1;
++
++                    for(i=0;i<pcrSelectionIn.count;i++)
++                    {
++                        pcrSelectionIn.pcrSelections[i].hash = TPM2_ALG_SHA1;
++                        pcrSelectionIn.pcrSelections[i].sizeofSelect=3;
++                        pcrSelectionIn.pcrSelections[i].pcrSelect[sizeofSelect] = (1<<pcrSelect);
++                    }
++                    vtpmloginfo(VTPM_LOG_VTPM, "Passthrough: TPM2_PcrRead\n");
++                    TPMTRYRETURN(TPM2_PCR_Read(pcrSelectionIn,&pcrUpdateCounter,&pcrSelectionOut,&pcrValues));
++                    //resp tag
++                    *(UINT16 *)ptr = (TPM_TAG_RSP_COMMAND);
++                    //resp size
++                    *(UINT32 *)(ptr + 2) = (10 + SHA1_DIGEST_SIZE);
++                    //resp status
++                    *(UINT32 *)(ptr + 6) = (status);
++                    //resp buffer
++                    memcpy((ptr+10),pcrValues.digests[0].buffer,SHA1_DIGEST_SIZE);
++					tpmcmd->resp_len = *(ptr + 2);
++					return status;
++                }
++            default:
++               vtpmlogerror(VTPM_LOG_VTPM, "TPM Disallowed Passthrough ord=%" PRIu32 "\n", ord);
++               status = TPM_DISABLED_CMD;
++               goto abort_egress;
++         }
++
++         size = TCPA_MAX_BUFFER_LENGTH;
++         TPMTRYRETURN(TPM_TransmitData(tpmcmd->req, tpmcmd->req_len,\
++										tpmcmd->resp, &size));
++         tpmcmd->resp_len = size;
++
++         unpack_TPM_RESULT(tpmcmd->resp + sizeof(TPM_TAG) + sizeof(UINT32), &status);
++         return status;
++
++         break;
++      default:
++         vtpmlogerror(VTPM_LOG_VTPM, "Invalid tag=%" PRIu16 "\n", tag);
++         status = TPM_BADTAG;
++   }
++
++abort_egress:
++   tpmcmd->resp_len = VTPM_COMMAND_HEADER_SIZE;
++   pack_TPM_RSP_HEADER(tpmcmd->resp,
++         tag + 3, tpmcmd->resp_len, status);
++
++   return status;
++}
+diff --git a/stubdom/vtpmmgr/vtpm_storage.c b/stubdom/vtpmmgr/vtpm_storage.c
+index de21b4a..98302dc 100644
+--- a/stubdom/vtpmmgr/vtpm_storage.c
++++ b/stubdom/vtpmmgr/vtpm_storage.c
+@@ -101,6 +101,8 @@
+ #define MAX(a,b) ( ((a) > (b)) ? (a) : (b) )
+ #define MIN(a,b) ( ((a) < (b)) ? (a) : (b) )
+ 
++extern TPM_RC tpm2_try_take_ownership(void);
++
+ /* blkfront device objets */
+ static struct blkfront_dev* blkdev = NULL;
+ static int blkfront_fd = -1;
+@@ -792,3 +794,462 @@ void add_fake_vtpms(int num) {
+    }
+ }
+ #endif
++
++/*TPM 2.0, vtpm2_storage */
++static TPM_RESULT vtpm2_storage_new_vtpm(const uuid_t uuid, int index)
++{
++   TPM_RESULT status = TPM_SUCCESS;
++   uint8_t plain[BUF_SIZE + AES_BLOCK_SIZE];
++   uint8_t buf[BUF_SIZE];
++   uint8_t* ptr;
++   int cipher_sz;
++   aes_context aes;
++
++   /* Add new vtpm to the table */
++   vtpm_add(uuid, g_store.end_offset, index);
++   g_store.end_offset += RSA_CIPHER_SIZE;
++
++   /* Compute the new end location of the encrypted uuid table */
++   cipher_sz = AES_BLOCK_SIZE; //IV
++   cipher_sz += g_store.num_vtpms * UUID_TBL_ENT_SIZE; //uuid table
++   cipher_sz += (AES_BLOCK_SIZE - (cipher_sz & (AES_BLOCK_SIZE -1))) & (AES_BLOCK_SIZE-1); //aes padding
++
++   /* Does this overlap any key data? If so they need to be relocated */
++   int uuid_end = (g_store.uuid_offset + cipher_sz + RSA_CIPHER_SIZE) & ~(RSA_CIPHER_SIZE -1);
++   for(int i = 0; i < g_store.num_vtpms; ++i) {
++      if(g_store.vtpms[i].offset < uuid_end) {
++
++         vtpmloginfo(VTPM_LOG_VTPM, "Relocating vtpm data\n");
++
++         //Read the hashkey cipher text
++         lseek(blkfront_fd, g_store.vtpms[i].offset, SEEK_SET);
++         TRY_READ(buf, RSA_CIPHER_SIZE, "vtpm hashkey relocate");
++
++         //Write the cipher text to new offset
++         lseek(blkfront_fd, g_store.end_offset, SEEK_SET);
++         TRY_WRITE(buf, RSA_CIPHER_SIZE, "vtpm hashkey relocate");
++
++         //Save new offset
++         g_store.vtpms[i].offset = g_store.end_offset;
++         g_store.end_offset += RSA_CIPHER_SIZE;
++      }
++   }
++
++   vtpmloginfo(VTPM_LOG_VTPM, "Generating a new symmetric key\n");
++
++   /* Generate an aes key */
++   TPMTRYRETURN(vtpmmgr_rand(plain, AES_KEY_SIZE));
++   aes_setkey_enc(&aes, plain, AES_KEY_BITS);
++   ptr = plain + AES_KEY_SIZE;
++
++   /* Pack the crypted size */
++   ptr = pack_UINT32(ptr, cipher_sz);
++
++   vtpmloginfo(VTPM_LOG_VTPM, "Binding encrypted key\n");
++
++   TPMTRYRETURN(TPM2_Bind(vtpm_globals.sk_handle,
++               plain,
++               ptr - plain,
++               buf));
++
++   /* Write the sealed key to disk */
++   lseek(blkfront_fd, g_store.aes_offset, SEEK_SET);
++   TRY_WRITE(buf, RSA_CIPHER_SIZE, "vtpm aes key");
++
++   /* ENCRYPT AND WRITE UUID TABLE */
++
++   vtpmloginfo(VTPM_LOG_VTPM, "Encrypting the uuid table\n");
++
++   int num_vtpms = 0;
++   int overlap = 0;
++   int bytes_crypted;
++   uint8_t iv[AES_BLOCK_SIZE];
++
++   /* Generate the iv for the first block */
++   TPMTRYRETURN(vtpmmgr_rand(iv, AES_BLOCK_SIZE));
++
++   /* Copy the iv to the cipher text buffer to be written to disk */
++   memcpy(buf, iv, AES_BLOCK_SIZE);
++   ptr = buf + AES_BLOCK_SIZE;
++
++   /* Encrypt the first block of the uuid table */
++   bytes_crypted = vtpm_encrypt_block(&aes,
++         iv, //iv
++         plain, //plaintext
++         ptr, //cipher text
++         BUF_SIZE - AES_BLOCK_SIZE,
++         &overlap,
++         &num_vtpms);
++
++   /* Write the iv followed by the crypted table*/
++   TRY_WRITE(buf, bytes_crypted + AES_BLOCK_SIZE, "vtpm uuid table");
++
++   /* Decrement the number of bytes encrypted */
++   cipher_sz -= bytes_crypted + AES_BLOCK_SIZE;
++
++   /* If there are more vtpms, encrypt and write them block by block */
++   while(cipher_sz > 0) {
++      /* Encrypt the next block of the uuid table */
++      bytes_crypted = vtpm_encrypt_block(&aes,
++               iv,
++               plain,
++               buf,
++               BUF_SIZE,
++               &overlap,
++               &num_vtpms);
++
++      /* Write the cipher text to disk */
++      TRY_WRITE(buf, bytes_crypted, "vtpm uuid table");
++
++      cipher_sz -= bytes_crypted;
++   }
++
++   goto egress;
++abort_egress:
++egress:
++   return status;
++}
++
++
++TPM_RESULT vtpm2_storage_load_hashkey(const uuid_t uuid, uint8_t hashkey[HASHKEYSZ])
++{
++   TPM_RESULT status = TPM_SUCCESS;
++   int index;
++   uint8_t cipher[RSA_CIPHER_SIZE];
++   uint8_t clear[RSA_CIPHER_SIZE];
++   UINT32 clear_size;
++
++   /* Find the index of this uuid */
++   if((index = vtpm_get_index(uuid)) < 0) {
++      index = -index-1;
++      vtpmlogerror(VTPM_LOG_VTPM, "LoadKey failure: Unrecognized uuid! " UUID_FMT "\n", UUID_BYTES(uuid));
++      status = TPM_BAD_PARAMETER;
++      goto abort_egress;
++   }
++
++   /* Read the table entry */
++   lseek(blkfront_fd, g_store.vtpms[index].offset, SEEK_SET);
++   TRY_READ(cipher, RSA_CIPHER_SIZE, "vtpm hashkey data");
++
++   /* Decrypt the table entry */
++   TPMTRYRETURN(TPM2_UnBind(
++               vtpm_globals.sk_handle,
++               RSA_CIPHER_SIZE,
++               cipher,
++               &clear_size,
++               clear));
++
++   if(clear_size < HASHKEYSZ) {
++      vtpmloginfo(VTPM_LOG_VTPM, "Decrypted Hash key size (%" PRIu32 ") was too small!\n", clear_size);
++      status = TPM_RESOURCES;
++      goto abort_egress;
++   }
++
++   memcpy(hashkey, clear, HASHKEYSZ);
++
++   vtpmloginfo(VTPM_LOG_VTPM, "Loaded hash and key for vtpm " UUID_FMT "\n", UUID_BYTES(uuid));
++   goto egress;
++abort_egress:
++   vtpmlogerror(VTPM_LOG_VTPM, "Failed to load key\n");
++egress:
++   return status;
++}
++
++TPM_RESULT vtpm2_storage_save_hashkey(const uuid_t uuid, uint8_t hashkey[HASHKEYSZ])
++{
++   TPM_RESULT status = TPM_SUCCESS;
++   int index;
++   uint8_t buf[RSA_CIPHER_SIZE];
++
++   /* Find the index of this uuid */
++   if((index = vtpm_get_index(uuid)) < 0) {
++      index = -index-1;
++      /* Create a new vtpm */
++      TPMTRYRETURN( vtpm2_storage_new_vtpm(uuid, index) );
++   }
++
++   /* Encrypt the hash and key */
++   TPMTRYRETURN( TPM2_Bind(vtpm_globals.sk_handle,
++               hashkey,
++               HASHKEYSZ,
++               buf));
++
++   /* Write to disk */
++   lseek(blkfront_fd, g_store.vtpms[index].offset, SEEK_SET);
++   TRY_WRITE(buf, RSA_CIPHER_SIZE, "vtpm hashkey data");
++
++   vtpmloginfo(VTPM_LOG_VTPM, "Saved hash and key for vtpm " UUID_FMT "\n", UUID_BYTES(uuid));
++   goto egress;
++abort_egress:
++   vtpmlogerror(VTPM_LOG_VTPM, "Failed to save key\n");
++egress:
++   return status;
++}
++
++TPM_RESULT vtpm2_storage_new_header()
++{
++   TPM_RESULT status = TPM_SUCCESS;
++   uint8_t buf[BUF_SIZE];
++   uint8_t keybuf[AES_KEY_SIZE + sizeof(uint32_t)];
++   uint8_t* ptr = buf;
++   uint8_t* sptr;
++
++   /* Clear everything first */
++   reset_store();
++
++   vtpmloginfo(VTPM_LOG_VTPM, "Creating new disk image header\n");
++
++   /*Copy the ID string */
++   memcpy(ptr, IDSTR, IDSTRLEN);
++   ptr += IDSTRLEN;
++
++   /*Copy the version */
++   ptr = pack_UINT32(ptr, DISKVERS);
++
++   /*Save the location of the key size */
++   sptr = ptr;
++   ptr += sizeof(UINT32);
++
++   vtpmloginfo(VTPM_LOG_VTPM, "Saving root storage key..\n");
++
++   /* Copy the storage key */
++   ptr = pack_TPM2_RSA_KEY(ptr, &vtpm_globals.tpm2_storage_key);
++
++   /* Now save the size */
++   pack_UINT32(sptr, ptr - (sptr + 4));
++
++   /* Create a fake aes key and set cipher text size to 0 */
++   memset(keybuf, 0, sizeof(keybuf));
++
++   vtpmloginfo(VTPM_LOG_VTPM, "Binding uuid table symmetric key..\n");
++
++   /* Save the location of the aes key */
++   g_store.aes_offset = ptr - buf;
++
++   /* Store the fake aes key and vtpm count */
++   TPMTRYRETURN(TPM2_Bind(vtpm_globals.sk_handle,
++               keybuf,
++               sizeof(keybuf),
++               ptr));
++
++   ptr+= RSA_CIPHER_SIZE;
++
++   /* Write the header to disk */
++   lseek(blkfront_fd, 0, SEEK_SET);
++   TRY_WRITE(buf, ptr-buf, "vtpm header");
++
++   /* Save the location of the uuid table */
++   g_store.uuid_offset = get_offset();
++
++   /* Save the end offset */
++   g_store.end_offset = (g_store.uuid_offset + RSA_CIPHER_SIZE) & ~(RSA_CIPHER_SIZE -1);
++
++   vtpmloginfo(VTPM_LOG_VTPM, "Saved new manager disk header.\n");
++
++   goto egress;
++abort_egress:
++egress:
++   return status;
++}
++
++TPM_RESULT vtpm2_storage_load_header(void)
++{
++   TPM_RESULT status = TPM_SUCCESS;
++   uint32_t v32;
++   uint8_t buf[BUF_SIZE];
++   uint8_t* ptr = buf;
++   aes_context aes;
++
++   /* Clear everything first */
++   reset_store();
++
++   /* Read the header from disk */
++   lseek(blkfront_fd, 0, SEEK_SET);
++   TRY_READ(buf, IDSTRLEN + sizeof(UINT32) + sizeof(UINT32), "vtpm header");
++
++   vtpmloginfo(VTPM_LOG_VTPM, "Loading disk image header\n");
++
++   /* Verify the ID string */
++   if(memcmp(ptr, IDSTR, IDSTRLEN)) {
++      vtpmlogerror(VTPM_LOG_VTPM, "Invalid ID string in disk image!\n");
++      status = TPM_FAIL;
++      goto abort_egress;
++   }
++   ptr+=IDSTRLEN;
++
++   /* Unpack the version */
++   ptr = unpack_UINT32(ptr, &v32);
++
++   /* Verify the version */
++   if(v32 != DISKVERS) {
++      vtpmlogerror(VTPM_LOG_VTPM, "Unsupported disk image version number %" PRIu32 "\n", v32);
++      status = TPM_FAIL;
++      goto abort_egress;
++   }
++
++   /* Size of the storage key */
++   ptr = unpack_UINT32(ptr, &v32);
++
++   /* Sanity check */
++   if(v32 > BUF_SIZE) {
++      vtpmlogerror(VTPM_LOG_VTPM, "Size of storage key (%" PRIu32 ") is too large!\n", v32);
++      status = TPM_IOERROR;
++      goto abort_egress;
++   }
++
++   /* read the storage key */
++   TRY_READ(buf, v32, "storage pub key");
++
++   vtpmloginfo(VTPM_LOG_VTPM, "Unpacking storage key\n");
++
++   /* unpack the storage key */
++   ptr = unpack_TPM2_RSA_KEY(buf, &vtpm_globals.tpm2_storage_key);
++
++   /* Load Storage Key into the TPM */
++   /* create SRK first */
++   tpm2_try_take_ownership();
++
++   TPMTRYRETURN( TPM2_Load(
++               vtpm_globals.srk_handle,
++               &vtpm_globals.tpm2_storage_key.Private,
++               &vtpm_globals.tpm2_storage_key.Public,
++               &vtpm_globals.sk_handle,
++               &vtpm_globals.sk_name));
++
++   /* Initialize the storage key auth */
++   memset(vtpm_globals.storage_key_usage_auth, 0, sizeof(TPM_AUTHDATA));
++
++   /* Store the offset of the aes key */
++   g_store.aes_offset = get_offset();
++
++   /* Read the rsa cipher text for the aes key */
++   TRY_READ(buf, RSA_CIPHER_SIZE, "aes key");
++   ptr = buf + RSA_CIPHER_SIZE;
++
++
++   vtpmloginfo(VTPM_LOG_VTPM, "Unbinding uuid table symmetric key\n");
++
++   /* Decrypt the aes key protecting the uuid table */
++   UINT32 datalen;
++
++   TPMTRYRETURN(TPM2_UnBind(
++               vtpm_globals.sk_handle,
++               RSA_CIPHER_SIZE,
++               buf,
++               &datalen,
++               ptr));
++
++   /* Validate the length of the output buffer */
++   if(datalen < AES_KEY_SIZE + sizeof(UINT32)) {
++      vtpmlogerror(VTPM_LOG_VTPM, "Unbound AES key size (%d) was too small! expected (%zu)\n", datalen, AES_KEY_SIZE + sizeof(UINT32));
++      status = TPM_IOERROR;
++      goto abort_egress;
++   }
++
++   /* Extract the aes key */
++   aes_setkey_dec(&aes, ptr, AES_KEY_BITS);
++   ptr+= AES_KEY_SIZE;
++
++   /* Extract the ciphertext size */
++   ptr = unpack_UINT32(ptr, &v32);
++   int cipher_size = v32;
++
++   /* Sanity check */
++   if(cipher_size & (AES_BLOCK_SIZE-1)) {
++      vtpmlogerror(VTPM_LOG_VTPM, "Cipher text size (%" PRIu32 ") is not a multiple of the aes block size! (%d)\n", v32, AES_BLOCK_SIZE);
++      status = TPM_IOERROR;
++      goto abort_egress;
++   }
++
++   /* Save the location of the uuid table */
++   g_store.uuid_offset = get_offset();
++
++
++   /* Only decrypt the table if there are vtpms to decrypt */
++   if(cipher_size > 0) {
++      int rbytes;
++      int overlap = 0;
++      uint8_t plain[BUF_SIZE + AES_BLOCK_SIZE];
++      uint8_t iv[AES_BLOCK_SIZE];
++
++      vtpmloginfo(VTPM_LOG_VTPM, "Decrypting uuid table\n");
++
++      /* Pre allocate the vtpm array */
++      g_store.num_vtpms_alloced = cipher_size / UUID_TBL_ENT_SIZE;
++      g_store.vtpms = malloc(sizeof(struct Vtpm) * g_store.num_vtpms_alloced);
++
++      /* Read the iv and the first chunk of cipher text */
++      rbytes = MIN(cipher_size, BUF_SIZE);
++      TRY_READ(buf, rbytes, "vtpm uuid table\n");
++      cipher_size -= rbytes;
++
++      /* Copy the iv */
++      memcpy(iv, buf, AES_BLOCK_SIZE);
++      ptr = buf + AES_BLOCK_SIZE;
++
++      /* Remove the iv from the number of bytes to decrypt */
++      rbytes -= AES_BLOCK_SIZE;
++
++      /* Decrypt and extract vtpms */
++      vtpm_decrypt_block(&aes,
++            iv, ptr, plain,
++            rbytes, &overlap);
++
++      /* Read the rest of the table if there is more */
++      while(cipher_size > 0) {
++         /* Read next chunk of cipher text */
++         rbytes = MIN(cipher_size, BUF_SIZE);
++         TRY_READ(buf, rbytes, "vtpm uuid table");
++         cipher_size -= rbytes;
++
++         /* Decrypt a block of text */
++         vtpm_decrypt_block(&aes,
++               iv, buf, plain,
++               rbytes, &overlap);
++
++      }
++      vtpmloginfo(VTPM_LOG_VTPM, "Loaded %d vtpms!\n", g_store.num_vtpms);
++   }
++
++   /* The end of the key table, new vtpms go here */
++   int uuid_end = (get_offset() + RSA_CIPHER_SIZE) & ~(RSA_CIPHER_SIZE -1);
++   g_store.end_offset = uuid_end;
++
++   /* Compute the end offset while validating vtpms*/
++   for(int i = 0; i < g_store.num_vtpms; ++i) {
++      /* offset must not collide with previous data */
++      if(g_store.vtpms[i].offset < uuid_end) {
++         vtpmlogerror(VTPM_LOG_VTPM, "vtpm: " UUID_FMT
++               " offset (%d) is before end of uuid table (%d)!\n",
++               UUID_BYTES(g_store.vtpms[i].uuid),
++               g_store.vtpms[i].offset, uuid_end);
++         status = TPM_IOERROR;
++         goto abort_egress;
++      }
++      /* offset must be at a multiple of cipher size */
++      if(g_store.vtpms[i].offset & (RSA_CIPHER_SIZE-1)) {
++         vtpmlogerror(VTPM_LOG_VTPM, "vtpm: " UUID_FMT
++               " offset(%d) is not at a multiple of the rsa cipher text size (%d)!\n",
++               UUID_BYTES(g_store.vtpms[i].uuid),
++               g_store.vtpms[i].offset, RSA_CIPHER_SIZE);
++         status = TPM_IOERROR;
++         goto abort_egress;
++      }
++      /* Save the last offset */
++      if(g_store.vtpms[i].offset >= g_store.end_offset) {
++         g_store.end_offset = g_store.vtpms[i].offset + RSA_CIPHER_SIZE;
++      }
++   }
++
++   goto egress;
++abort_egress:
++   //An error occured somewhere
++   vtpmlogerror(VTPM_LOG_VTPM, "Failed to load manager data!\n");
++
++   //Clear the data store
++   reset_store();
++
++   vtpm_globals.storage_key_handle = 0;
++egress:
++   return status;
++}
+diff --git a/stubdom/vtpmmgr/vtpm_storage.h b/stubdom/vtpmmgr/vtpm_storage.h
+index a5a5fd7..b9c4ff5 100644
+--- a/stubdom/vtpmmgr/vtpm_storage.h
++++ b/stubdom/vtpmmgr/vtpm_storage.h
+@@ -65,4 +65,14 @@ TPM_RESULT vtpm_storage_load_header(void);
+ TPM_RESULT vtpm_storage_new_header(void);
+ 
+ 
++
++/* TPM 2.0 */
++TPM_RESULT vtpm2_storage_load_hashkey(const uuid_t uuid, uint8_t hashkey[HASHKEYSZ]);
++TPM_RESULT vtpm2_storage_save_hashkey(const uuid_t uuid, uint8_t hashkey[HASHKEYSZ]);
++
++/* Load the vtpm manager data - call this on startup */
++TPM_RESULT vtpm2_storage_load_header(void);
++
++/* Saves the vtpm manager data - call this on shutdown */
++TPM_RESULT vtpm2_storage_new_header(void);
+ #endif
+diff --git a/stubdom/vtpmmgr/vtpmmgr.c b/stubdom/vtpmmgr/vtpmmgr.c
+index 270ca8a..e3a7b2c 100644
+--- a/stubdom/vtpmmgr/vtpmmgr.c
++++ b/stubdom/vtpmmgr/vtpmmgr.c
+@@ -45,8 +45,8 @@
+ #include "vtpmmgr.h"
+ #include "tcg.h"
+ 
+-
+-void main_loop(void) {
++void main_loop(char *version)
++{
+    tpmcmd_t* tpmcmd;
+    uint8_t respbuf[TCPA_MAX_BUFFER_LENGTH];
+ 
+@@ -61,7 +61,11 @@ void main_loop(void) {
+       tpmcmd->resp = respbuf;
+ 
+       /* Process the command */
+-      vtpmmgr_handle_cmd(tpmcmd->opaque, tpmcmd);
++      if(!strncmp(version,"--tpm2",6)){
++         vtpmmgr2_handle_cmd(tpmcmd->opaque, tpmcmd);
++      }else{
++         vtpmmgr_handle_cmd(tpmcmd->opaque, tpmcmd);
++      }
+ 
+       /* Send response */
+       tpmback_resp(tpmcmd);
+@@ -71,22 +75,41 @@ void main_loop(void) {
+ int main(int argc, char** argv)
+ {
+    int rc = 0;
++   int i;
++   char tpm_version[6];
++
+    sleep(2);
+    vtpmloginfo(VTPM_LOG_VTPM, "Starting vTPM manager domain\n");
+ 
+-   /* Initialize the vtpm manager */
+-   if(vtpmmgr_init(argc, argv) != TPM_SUCCESS) {
+-      vtpmlogerror(VTPM_LOG_VTPM, "Unable to initialize vtpmmgr domain!\n");
+-      rc = -1;
+-      goto exit;
+-   }
++   //judge version is vtpmmgr1.2 or vtpmmgr2
++   for(i=1;i<argc;i++)
++   {
++	  if(!strncmp(argv[i],"--tpm2",6 ))
++      {
++		  strncpy(tpm_version,argv[i],6);
++          if(vtpmmgr2_init(argc, argv) != TPM_SUCCESS) {
++             vtpmlogerror(VTPM_LOG_VTPM, "Unable to initialize vtpmmgr2 domain!\n");
++             rc = -1;
++             goto exit;
++          }
++      }else{
++          if(vtpmmgr_init(argc, argv) != TPM_SUCCESS) {
++             vtpmlogerror(VTPM_LOG_VTPM, "Unable to initialize vtpmmgr domain!\n");
++             rc = -1;
++             goto exit;
++          }
++      }
+ 
+-   main_loop();
++       main_loop(tpm_version);
++   }//end judge vtpmmgr version
+ 
+    vtpmloginfo(VTPM_LOG_VTPM, "vTPM Manager shutting down...\n");
+ 
+    vtpmmgr_shutdown();
+ 
++err_invalid:
++   vtpmlogerror(VTPM_LOG_VTPM, "Invalid Option %s\n", argv[i]);
++   return -1;
+ exit:
+    return rc;
+ 
+diff --git a/stubdom/vtpmmgr/vtpmmgr.h b/stubdom/vtpmmgr/vtpmmgr.h
+index 50a1992..c2f7c94 100644
+--- a/stubdom/vtpmmgr/vtpmmgr.h
++++ b/stubdom/vtpmmgr/vtpmmgr.h
+@@ -44,6 +44,7 @@
+ #include "uuid.h"
+ #include "tcg.h"
+ #include "vtpm_manager.h"
++#include "tpm2_types.h"
+ 
+ #define RSA_KEY_SIZE 0x0800
+ #define RSA_CIPHER_SIZE (RSA_KEY_SIZE / 8)
+@@ -60,6 +61,18 @@ struct vtpm_globals {
+ 
+    entropy_context     entropy;
+    ctr_drbg_context    ctr_drbg;
++
++   /* TPM 2.0 */
++   TPM_AuthArea        pwAuth;
++   TPM_AuthArea        srk_AuthArea;
++   TPM2B_AUTH          TPM2_ownerAuth;
++   TPM2B_AUTH          TPM2_endorsementAuth;
++   TPM2B_AUTH          TPM2_lockoutAuth;
++   TPM_HANDLE          srk_handle;
++   TPM_HANDLE          sk_handle;
++   TPM2B_NAME          sk_name;
++   TPM2_RSA_KEY        tpm2_storage_key;
++
+ };
+ 
+ // --------------------------- Global Values --------------------------
+@@ -74,4 +87,8 @@ inline TPM_RESULT vtpmmgr_rand(unsigned char* bytes, size_t num_bytes) {
+    return ctr_drbg_random(&vtpm_globals.ctr_drbg, bytes, num_bytes) == 0 ? 0 : TPM_FAIL;
+ }
+ 
++/* TPM 2.0 */
++TPM_RESULT vtpmmgr2_init(int argc, char** argv);
++TPM_RESULT vtpmmgr2_handle_cmd(const uuid_t uuid, tpmcmd_t* tpmcmd);
++
+ #endif
+--- /dev/null	2014-08-15 05:44:48.032690005 -0400
++++ stubdom/vtpmmgr/tpm2_types.h	2014-08-15 10:36:03.676690006 -0400
+@@ -0,0 +1,981 @@
++#ifndef __TPM2_TYPES_H__
++#define __TPM2_TYPES_H__
++
++#include <stdlib.h>
++#include <stdint.h>
++
++// "implementation.h"
++// Table 212 -- Logic Values
++#define    YES      1
++#define    NO       0
++#ifndef TRUE
++#define    TRUE     1
++#endif
++#ifndef FALSE
++#define    FALSE    0
++#endif
++
++#ifndef true
++#define true		1
++#endif
++#ifndef false
++#define false		0
++#endif
++#define    SET      1
++#define    CLEAR    0
++
++
++// Table 214 -- Implemented Algorithms
++#define    ALG_RSA               YES    // 1
++#define    ALG_DES               NO     // 0
++#define    ALG__3DES             NO     // 0
++#define    ALG_SHA1              YES    // 1
++#define    ALG_HMAC              YES    // 1
++#define    ALG_AES               YES    // 1
++#define    ALG_MGF1              YES    // 1
++#define    ALG_XOR               YES    // 1
++#define    ALG_KEYEDHASH         YES    // 1
++#define    ALG_SHA256            YES    // 1
++#define    ALG_SHA384            YES    // 0
++#define    ALG_SHA512            YES    // 0
++#define    ALG_WHIRLPOOL512      YES    // 0
++#define    ALG_SM3_256           YES    // 1
++#define    ALG_SM4               YES    // 1
++#define    ALG_RSASSA            YES    // 1
++#define    ALG_RSAES             YES    // 1
++#define    ALG_RSAPSS            YES    // 1
++#define    ALG_OAEP              YES    // 1
++#define    ALG_ECC               YES    // 1
++#define	   ALG_CFB				 YES	// 1
++#define    ALG_ECDH              YES    // 1
++#define    ALG_ECDSA             YES    // 1
++#define    ALG_ECDAA             YES    // 1
++#define    ALG_SM2               YES    // 1
++#define    ALG_ECSCHNORR         YES    // 1
++#define    ALG_SYMCIPHER         YES    // 1
++#define    ALG_KDF1_SP800_56a    YES    // 1
++#define    ALG_KDF2              NO     // 0
++#define    ALG_KDF1_SP800_108    YES    // 1
++#define    ALG_CTR               YES    // 1
++#define    ALG_OFB               YES    // 1
++#define    ALG_CBC               YES    // 1
++
++#define HASH_COUNT (\
++		    ALG_SHA1+ALG_SHA256+ALG_SHA384+ALG_SHA512+ALG_WHIRLPOOL512+ALG_SM3_256)
++
++// Table 216 -- RSA Algorithm Constants
++#define    RSA_KEY_SIZES_BITS    2048    // {1024,2048}
++#define    MAX_RSA_KEY_BITS      2048
++#define    MAX_RSA_KEY_BYTES     ((MAX_RSA_KEY_BITS + 7) / 8)    // 256
++
++// Table 218 -- AES Algorithm Constants
++#define    AES_KEY_SIZES_BITS          128
++#define    MAX_AES_KEY_BITS            128
++#define    MAX_AES_BLOCK_SIZE_BYTES    16
++#define    MAX_AES_KEY_BYTES           ((MAX_AES_KEY_BITS + 7) / 8)    // 16
++
++
++// Table 220 -- Symmetric Algorithm Constants
++#define    MAX_SYM_KEY_BITS      MAX_AES_KEY_BITS    // 128
++#define    MAX_SYM_KEY_BYTES     MAX_AES_KEY_BYTES    // 16
++#define    MAX_SYM_BLOCK_SIZE    MAX_AES_BLOCK_SIZE_BYTES    // 16
++
++#define    MAX_SYM_DATA                   128
++#define MAX_ECC_KEY_BITS	256
++#define MAX_ECC_KEY_BYTES	((MAX_ECC_KEY_BITS + 7) / 8)
++
++
++typedef unsigned char BYTE;
++typedef unsigned char BOOL;
++typedef uint8_t	UINT8;
++typedef uint16_t UINT16;
++typedef uint32_t UINT32;
++typedef uint64_t UINT64;
++
++// TPM2 command code
++
++typedef UINT32 TPM_CC;
++#define    TPM_CC_FIRST                         (TPM_CC)(0x0000011F)
++#define    TPM_CC_PP_FIRST                      (TPM_CC)(0x0000011F)
++#define    TPM_CC_NV_UndefineSpaceSpecial       (TPM_CC)(0x0000011F)
++#define    TPM_CC_EvictControl                  (TPM_CC)(0x00000120)
++#define    TPM_CC_HierarchyControl              (TPM_CC)(0x00000121)
++#define    TPM_CC_NV_UndefineSpace              (TPM_CC)(0x00000122)
++#define    TPM_CC_ChangeEPS                     (TPM_CC)(0x00000124)
++#define    TPM_CC_ChangePPS                     (TPM_CC)(0x00000125)
++#define    TPM_CC_Clear                         (TPM_CC)(0x00000126)
++#define    TPM_CC_ClearControl                  (TPM_CC)(0x00000127)
++#define    TPM_CC_ClockSet                      (TPM_CC)(0x00000128)
++#define    TPM_CC_HierarchyChangeAuth           (TPM_CC)(0x00000129)
++#define    TPM_CC_NV_DefineSpace                (TPM_CC)(0x0000012A)
++#define    TPM_CC_PCR_Allocate                  (TPM_CC)(0x0000012B)
++#define    TPM_CC_PCR_SetAuthPolicy             (TPM_CC)(0x0000012C)
++#define    TPM_CC_PP_Commands                   (TPM_CC)(0x0000012D)
++#define    TPM_CC_SetPrimaryPolicy              (TPM_CC)(0x0000012E)
++#define    TPM_CC_FieldUpgradeStart             (TPM_CC)(0x0000012F)
++#define    TPM_CC_ClockRateAdjust               (TPM_CC)(0x00000130)
++#define    TPM_CC_CreatePrimary                 (TPM_CC)(0x00000131)
++#define    TPM_CC_NV_GlobalWriteLock            (TPM_CC)(0x00000132)
++#define    TPM_CC_PP_LAST                       (TPM_CC)(0x00000132)
++#define    TPM_CC_GetCommandAuditDigest         (TPM_CC)(0x00000133)
++#define    TPM_CC_NV_Increment                  (TPM_CC)(0x00000134)
++#define    TPM_CC_NV_SetBits                    (TPM_CC)(0x00000135)
++#define    TPM_CC_NV_Extend                     (TPM_CC)(0x00000136)
++#define    TPM_CC_NV_Write                      (TPM_CC)(0x00000137)
++#define    TPM_CC_NV_WriteLock                  (TPM_CC)(0x00000138)
++#define    TPM_CC_DictionaryAttackLockReset     (TPM_CC)(0x00000139)
++#define    TPM_CC_DictionaryAttackParameters    (TPM_CC)(0x0000013A)
++#define    TPM_CC_NV_ChangeAuth                 (TPM_CC)(0x0000013B)
++#define    TPM_CC_PCR_Event                     (TPM_CC)(0x0000013C)
++#define    TPM_CC_PCR_Reset                     (TPM_CC)(0x0000013D)
++#define    TPM_CC_SequenceComplete              (TPM_CC)(0x0000013E)
++#define    TPM_CC_SetAlgorithmSet               (TPM_CC)(0x0000013F)
++#define    TPM_CC_SetCommandCodeAuditStatus     (TPM_CC)(0x00000140)
++#define    TPM_CC_FieldUpgradeData              (TPM_CC)(0x00000141)
++#define    TPM_CC_IncrementalSelfTest           (TPM_CC)(0x00000142)
++#define    TPM_CC_SelfTest                      (TPM_CC)(0x00000143)
++#define    TPM_CC_Startup                       (TPM_CC)(0x00000144)
++#define    TPM_CC_Shutdown                      (TPM_CC)(0x00000145)
++#define    TPM_CC_StirRandom                    (TPM_CC)(0x00000146)
++#define    TPM_CC_ActivateCredential            (TPM_CC)(0x00000147)
++#define    TPM_CC_Certify                       (TPM_CC)(0x00000148)
++#define    TPM_CC_PolicyNV                      (TPM_CC)(0x00000149)
++#define    TPM_CC_CertifyCreation               (TPM_CC)(0x0000014A)
++#define    TPM_CC_Duplicate                     (TPM_CC)(0x0000014B)
++#define    TPM_CC_GetTime                       (TPM_CC)(0x0000014C)
++#define    TPM_CC_GetSessionAuditDigest         (TPM_CC)(0x0000014D)
++#define    TPM_CC_NV_Read                       (TPM_CC)(0x0000014E)
++#define    TPM_CC_NV_ReadLock                   (TPM_CC)(0x0000014F)
++#define    TPM_CC_ObjectChangeAuth              (TPM_CC)(0x00000150)
++#define    TPM_CC_PolicySecret                  (TPM_CC)(0x00000151)
++#define    TPM_CC_Rewrap                        (TPM_CC)(0x00000152)
++#define    TPM_CC_Create                        (TPM_CC)(0x00000153)
++#define    TPM_CC_ECDH_ZGen                     (TPM_CC)(0x00000154)
++#define    TPM_CC_HMAC                          (TPM_CC)(0x00000155)
++#define    TPM_CC_Import                        (TPM_CC)(0x00000156)
++#define    TPM_CC_Load                          (TPM_CC)(0x00000157)
++#define    TPM_CC_Quote                         (TPM_CC)(0x00000158)
++#define    TPM_CC_RSA_Decrypt                   (TPM_CC)(0x00000159)
++#define    TPM_CC_HMAC_Start                    (TPM_CC)(0x0000015B)
++#define    TPM_CC_SequenceUpdate                (TPM_CC)(0x0000015C)
++#define    TPM_CC_Sign                          (TPM_CC)(0x0000015D)
++#define    TPM_CC_Unseal                        (TPM_CC)(0x0000015E)
++#define    TPM_CC_PolicySigned                  (TPM_CC)(0x00000160)
++#define    TPM_CC_ContextLoad                   (TPM_CC)(0x00000161)
++#define    TPM_CC_ContextSave                   (TPM_CC)(0x00000162)
++#define    TPM_CC_ECDH_KeyGen                   (TPM_CC)(0x00000163)
++#define    TPM_CC_EncryptDecrypt                (TPM_CC)(0x00000164)
++#define    TPM_CC_FlushContext                  (TPM_CC)(0x00000165)
++#define    TPM_CC_LoadExternal                  (TPM_CC)(0x00000167)
++#define    TPM_CC_MakeCredential                (TPM_CC)(0x00000168)
++#define    TPM_CC_NV_ReadPublic                 (TPM_CC)(0x00000169)
++#define    TPM_CC_PolicyAuthorize               (TPM_CC)(0x0000016A)
++#define    TPM_CC_PolicyAuthValue               (TPM_CC)(0x0000016B)
++#define    TPM_CC_PolicyCommandCode             (TPM_CC)(0x0000016C)
++#define    TPM_CC_PolicyCounterTimer            (TPM_CC)(0x0000016D)
++#define    TPM_CC_PolicyCpHash                  (TPM_CC)(0x0000016E)
++#define    TPM_CC_PolicyLocality                (TPM_CC)(0x0000016F)
++#define    TPM_CC_PolicyNameHash                (TPM_CC)(0x00000170)
++#define    TPM_CC_PolicyOR                      (TPM_CC)(0x00000171)
++#define    TPM_CC_PolicyTicket                  (TPM_CC)(0x00000172)
++#define    TPM_CC_ReadPublic                    (TPM_CC)(0x00000173)
++#define    TPM_CC_RSA_Encrypt                   (TPM_CC)(0x00000174)
++#define    TPM_CC_StartAuthSession              (TPM_CC)(0x00000176)
++#define    TPM_CC_VerifySignature               (TPM_CC)(0x00000177)
++#define    TPM_CC_ECC_Parameters                (TPM_CC)(0x00000178)
++#define    TPM_CC_FirmwareRead                  (TPM_CC)(0x00000179)
++#define    TPM_CC_GetCapability                 (TPM_CC)(0x0000017A)
++#define    TPM_CC_GetRandom                     (TPM_CC)(0x0000017B)
++#define    TPM_CC_GetTestResult                 (TPM_CC)(0x0000017C)
++#define    TPM_CC_Hash                          (TPM_CC)(0x0000017D)
++#define    TPM_CC_PCR_Read                      (TPM_CC)(0x0000017E)
++#define    TPM_CC_PolicyPCR                     (TPM_CC)(0x0000017F)
++#define    TPM_CC_PolicyRestart                 (TPM_CC)(0x00000180)
++#define    TPM_CC_ReadClock                     (TPM_CC)(0x00000181)
++#define    TPM_CC_PCR_Extend                    (TPM_CC)(0x00000182)
++#define    TPM_CC_PCR_SetAuthValue              (TPM_CC)(0x00000183)
++#define    TPM_CC_NV_Certify                    (TPM_CC)(0x00000184)
++#define    TPM_CC_EventSequenceComplete         (TPM_CC)(0x00000185)
++#define    TPM_CC_HashSequenceStart             (TPM_CC)(0x00000186)
++#define    TPM_CC_PolicyPhysicalPresence        (TPM_CC)(0x00000187)
++#define    TPM_CC_PolicyDuplicationSelect       (TPM_CC)(0x00000188)
++#define    TPM_CC_PolicyGetDigest               (TPM_CC)(0x00000189)
++#define    TPM_CC_TestParms                     (TPM_CC)(0x0000018A)
++#define    TPM_CC_Commit                        (TPM_CC)(0x0000018B)
++#define    TPM_CC_PolicyPassword                (TPM_CC)(0x0000018C)
++#define    TPM_CC_SM2_ZGen                      (TPM_CC)(0x0000018D)
++#define    TPM_CC_LAST                          (TPM_CC)(0x0000018D)
++
++
++//TPM_RC
++typedef UINT32 TPM_RC;
++
++// TPM_ST Constants
++typedef UINT16 TPM_ST;
++#define    TPM_ST_NULL                    (TPM_ST)(0X8000)
++#define    TPM_ST_NO_SESSIONS             (TPM_ST)(0x8001)
++#define    TPM_ST_SESSIONS                (TPM_ST)(0x8002)
++
++
++// TPM Handle types
++typedef UINT32    TPM_HANDLE;
++typedef UINT8 TPM_HT;
++
++
++// TPM_RH Constants
++typedef UINT32 TPM_RH;
++
++#define    TPM_RH_FIRST          (TPM_RH)(0x40000000)
++#define    TPM_RH_SRK            (TPM_RH)(0x40000000)
++#define    TPM_RH_OWNER          (TPM_RH)(0x40000001)
++#define    TPM_RS_PW             (TPM_RH)(0x40000009)
++#define    TPM_RH_LOCKOUT        (TPM_RH)(0x4000000A)
++#define    TPM_RH_ENDORSEMENT    (TPM_RH)(0x4000000B)
++#define    TPM_RH_PLATFORM       (TPM_RH)(0x4000000C)
++#define    TPM_RH_LAST           (TPM_RH)(0x4000000C)
++
++// Table 4 -- DocumentationClarity Types <I/O>
++typedef UINT32    TPM_ALGORITHM_ID;
++typedef UINT32    TPM_MODIFIER_INDICATOR;
++typedef UINT32    TPM_SESSION_OFFSET;
++typedef UINT16    TPM_KEY_SIZE;
++typedef UINT16    TPM_KEY_BITS;
++typedef UINT64    TPM_SYSTEM_ADDRESS;
++typedef UINT32 TPM_SPEC;
++
++// Table 29 -- TPMA_ALGORITHM Bits <I/O>
++typedef struct {
++    unsigned int asymmetric : 1;
++    unsigned int symmetric  : 1;
++    unsigned int hash       : 1;
++    unsigned int object     : 1;
++    unsigned int reserved5  : 4;
++    unsigned int signing    : 1;
++    unsigned int encrypting : 1;
++    unsigned int method     : 1;
++    unsigned int reserved9  : 21;
++} TPMA_ALGORITHM ;
++
++typedef UINT32 TPMA_OBJECT;
++
++typedef BYTE TPMA_SESSION;
++
++typedef BYTE TPMA_LOCALITY;
++
++// Table 37 -- TPMI_YES_NO Type <I/O>
++typedef BYTE TPMI_YES_NO;
++
++typedef TPM_HANDLE TPMI_RH_HIERARCHY_AUTH;
++
++// Table 38 -- TPMI_DH_OBJECT Type <I/O>
++typedef TPM_HANDLE TPMI_DH_OBJECT;
++
++// Table 39 -- TPMI_DH_PERSISTENT Type <I/O>
++typedef TPM_HANDLE TPMI_DH_PERSISTENT;
++
++// Table 42 -- TPMI_SH_AUTH_SESSION Type <I/O>
++typedef TPM_HANDLE TPMI_SH_AUTH_SESSION;
++
++// Table 40 -- TPMI_DH_ENTITY Type <I>
++typedef TPM_HANDLE TPMI_DH_ENTITY;
++
++// Table 45 -- TPMI_DH_CONTEXT Type <I/O>
++typedef TPM_HANDLE TPMI_DH_CONTEXT;
++
++// Table 46 -- TPMI_RH_HIERARCHY Type <I/O>
++typedef TPM_HANDLE TPMI_RH_HIERARCHY;
++
++// Table 47 -- TPMI_RH_HIERARCHY_AUTH Type <I>
++typedef TPM_HANDLE TPMI_RH_HIERARCHY_AUTH;
++
++// Table 48 -- TPMI_RH_PLATFORM Type <I>
++typedef TPM_HANDLE TPMI_RH_PLATFORM;
++
++// Table 49 -- TPMI_RH_OWNER Type <I>
++typedef TPM_HANDLE TPMI_RH_OWNER;
++
++// Table 50 -- TPMI_RH_ENDORSEMENT Type <I>
++typedef TPM_HANDLE TPMI_RH_ENDORSEMENT;
++
++// Table 51 -- TPMI_RH_PROVISION Type <I>
++typedef TPM_HANDLE TPMI_RH_PROVISION;
++
++// Table 52 -- TPMI_RH_CLEAR Type <I>
++typedef TPM_HANDLE TPMI_RH_CLEAR;
++
++// Table 54 -- TPMI_RH_LOCKOUT Type <I>
++typedef TPM_HANDLE TPMI_RH_LOCKOUT;
++
++// Table 7 -- TPM_ALG_ID
++typedef UINT16 TPM_ALG_ID;
++typedef UINT16 TPM_ALG_ID;
++
++#define    TPM2_ALG_ERROR             (TPM_ALG_ID)(0x0000)        // a: ; D:
++#define    TPM2_ALG_FIRST             (TPM_ALG_ID)(0x0001)        // a: ; D:
++#if ALG_RSA == YES || ALG_ALL == YES
++#define    TPM2_ALG_RSA               (TPM_ALG_ID)(0x0001)        // a: A O; D:
++#endif
++#if ALG_DES == YES || ALG_ALL == YES
++#define    TPM2_ALG_DES               (TPM_ALG_ID)(0x0002)        // a: S; D:
++#endif
++#define    TPM2_ALG_SHA1              (TPM_ALG_ID)(0x0004)        // a: H; D:
++#if ALG_HMAC == YES || ALG_ALL == YES
++#define    TPM2_ALG_HMAC              (TPM_ALG_ID)(0x0005)        // a: H X; D:
++#endif
++#if ALG_AES == YES || ALG_ALL == YES
++#define    TPM2_ALG_AES               (TPM_ALG_ID)(0x0006)        // a: S; D:
++#endif
++#if ALG_XOR == YES || ALG_ALL == YES
++#define    TPM2_ALG_XOR               (TPM_ALG_ID)(0x000A)        // a: H S; D:
++#endif
++#if ALG_MGF1 == YES || ALG_ALL == YES
++#define    TPM2_ALG_MGF1              (TPM_ALG_ID)(0x0007)        // a: H M; D:
++#endif
++#if ALG_KEYEDHASH == YES || ALG_ALL == YES
++#define    TPM2_ALG_KEYEDHASH         (TPM_ALG_ID)(0x0008)        // a: H E X O; D:
++#endif
++#if ALG_SHA256 == YES || ALG_ALL == YES
++#define    TPM2_ALG_SHA256            (TPM_ALG_ID)(0x000B)        // a: H; D:
++#endif
++#define    TPM2_ALG_NULL              (TPM_ALG_ID)(0x0010)        // a: ; D:
++#if ALG_OAEP == YES || ALG_ALL == YES
++#define    TPM2_ALG_OAEP              (TPM_ALG_ID)(0x0017)        // a: A E; D: RSA
++#endif
++#if ALG_ECC == YES || ALG_ALL == YES
++#define    TPM2_ALG_ECC               (TPM_ALG_ID)(0x0023)        // a: A O; D:
++#endif
++
++#if ALG_SM4 == YES || ALG_ALL == YES
++#define    TPM2_ALG_SM4               (TPM_ALG_ID)(0x0013)        // a: S; D:
++#endif
++#if ALG_SYMCIPHER == YES || ALG_ALL == YES
++#define    TPM2_ALG_SYMCIPHER         (TPM_ALG_ID)(0x0025)        // a: O; D:
++#endif
++#if ALG_CFB == YES || ALG_ALL == YES
++#define    TPM2_ALG_CFB               (TPM_ALG_ID)(0x0043)        // a: S E; D:
++#endif
++
++#define    TPM2_ALG_LAST              (TPM_ALG_ID)(0x0044)
++
++#define    SHA1_DIGEST_SIZE    20
++#define    SHA1_BLOCK_SIZE     64
++#define    SHA256_DIGEST_SIZE    32
++#define    SHA256_BLOCK_SIZE     64
++
++// Table 57 -- TPMI_ALG_ASYM Type <I/O>
++typedef TPM_ALG_ID TPMI_ALG_ASYM;
++
++// Table 56 -- TPMI_ALG_HASH Type <I/O>
++typedef TPM_ALG_ID TPMI_ALG_HASH;
++
++// Table 58 -- TPMI_ALG_SYM Type <I/O>
++typedef TPM_ALG_ID TPMI_ALG_SYM;
++
++// Table 59 -- TPMI_ALG_SYM_OBJECT Type <I/O>
++typedef TPM_ALG_ID TPMI_ALG_SYM_OBJECT;
++
++// Table 60 -- TPMI_ALG_SYM_MODE Type <I/O>
++typedef TPM_ALG_ID TPMI_ALG_SYM_MODE;
++
++// Table 61 -- TPMI_ALG_KDF Type <I/O>
++typedef TPM_ALG_ID TPMI_ALG_KDF;
++
++// Table 62 -- TPMI_ALG_SIG_SCHEME Type <I/O>
++typedef TPM_ALG_ID TPMI_ALG_SIG_SCHEME;
++
++// Table 65 -- TPMU_HA Union <I/O,S>
++typedef union {
++#ifdef TPM2_ALG_SHA1
++    BYTE  sha1[SHA1_DIGEST_SIZE];
++#endif
++#ifdef TPM2_ALG_SHA256
++    BYTE  sha256[SHA256_DIGEST_SIZE];
++#endif
++#ifdef TPM2_ALG_SM3_256
++    BYTE  sm3_256[SM3_256_DIGEST_SIZE];
++#endif
++#ifdef TPM2_ALG_SHA384
++    BYTE  sha384[SHA384_DIGEST_SIZE];
++#endif
++#ifdef TPM2_ALG_SHA512
++    BYTE  sha512[SHA512_DIGEST_SIZE];
++#endif
++#ifdef TPM2_ALG_WHIRLPOOL512
++    BYTE  whirlpool[WHIRLPOOL512_DIGEST_SIZE];
++#endif
++
++} TPMU_HA ;
++
++// Table 67 -- TPM2B_DIGEST Structure <I/O>
++typedef struct {
++    UINT16    size;
++    BYTE      buffer[sizeof(TPMU_HA)];
++} TPM2B_DIGEST;
++
++// Table 69 -- TPM2B_NONCE Types <I/O>
++typedef TPM2B_DIGEST    TPM2B_NONCE;
++
++typedef TPM2B_DIGEST	TPM2B_DATA;
++
++// Table 70 -- TPM2B_AUTH Types <I/O>
++typedef TPM2B_DIGEST    TPM2B_AUTH;
++
++// Table 71 -- TPM2B_OPERAND Types <I/O>
++typedef TPM2B_DIGEST    TPM2B_OPERAND;
++
++// Table 66 -- TPMT_HA Structure <I/O>
++typedef struct {
++    TPMI_ALG_HASH    hashAlg;
++    TPMU_HA          digest;
++} TPMT_HA;
++
++//Table 80 -- TPM2B_NAME Structure
++typedef struct {
++	UINT16 size;
++	BYTE name[sizeof(TPMT_HA)];
++} TPM2B_NAME;
++
++#define    IMPLEMENTATION_PCR             24
++#define    PLATFORM_PCR                   24
++#define    PCR_SELECT_MAX                 ((IMPLEMENTATION_PCR+7)/8)
++
++//Table 79 -- TPMS_PCR_SELECT Structure <I/O>
++typedef struct {
++    UINT8    sizeofSelect;
++    BYTE     pcrSelect[PCR_SELECT_MAX];
++} TPMS_PCR_SELECT;
++
++// Table 80 -- TPMS_PCR_SELECTION Structure <I/O>
++typedef struct {
++    TPMI_ALG_HASH    hash;
++    UINT8            sizeofSelect;
++    BYTE             pcrSelect[PCR_SELECT_MAX];
++} TPMS_PCR_SELECTION;
++
++// Table 83 -- TPMT_TK_CREATION Structure <I/O>
++typedef struct {
++    TPM_ST               tag;
++    TPMI_RH_HIERARCHY    hierarchy;
++    TPM2B_DIGEST         digest;
++} TPMT_TK_CREATION;
++
++// Table 96 -- Definition of TPML_DIGEST Structure <I/O>
++typedef struct {
++	UINT32				count;
++	TPM2B_DIGEST		digests[8];
++}TPML_DIGEST;
++
++// Table 97 -- TPML_PCR_SELECTION Structure <I/O>
++typedef struct {
++    UINT32                count;
++    TPMS_PCR_SELECTION    pcrSelections[HASH_COUNT];
++} TPML_PCR_SELECTION;
++
++// Table 119 -- TPMI_AES_KEY_BITS Type <I/O>
++typedef TPM_KEY_BITS TPMI_AES_KEY_BITS;
++
++// Table 120 -- TPMI_SM4_KEY_BITS Type <I/O>
++typedef TPM_KEY_BITS TPMI_SM4_KEY_BITS;
++
++// Table 121 -- TPMU_SYM_KEY_BITS Union <I/O>
++typedef union {
++#ifdef TPM2_ALG_AES
++    TPMI_AES_KEY_BITS  aes;
++#endif
++#ifdef TPM2_ALG_SM4
++    TPMI_SM4_KEY_BITS  SM4;
++#endif
++    TPM_KEY_BITS  sym;
++#ifdef TPM2_ALG_XOR
++    TPMI_ALG_HASH  xor;
++#endif
++
++} TPMU_SYM_KEY_BITS ;
++
++// Table 122 -- TPMU_SYM_MODE Union <I/O>
++typedef union {
++#ifdef TPM2_ALG_AES
++    TPMI_ALG_SYM_MODE  aes;
++#endif
++#ifdef TPM2_ALG_SM4
++    TPMI_ALG_SYM_MODE  SM4;
++#endif
++    TPMI_ALG_SYM_MODE  sym;
++
++} TPMU_SYM_MODE ;
++
++// Table 124 -- TPMT_SYM_DEF Structure <I/O>
++typedef struct {
++    TPMI_ALG_SYM         algorithm;
++    TPMU_SYM_KEY_BITS    keyBits;
++    TPMU_SYM_MODE        mode;
++} TPMT_SYM_DEF;
++
++// Table 125 -- TPMT_SYM_DEF_OBJECT Structure <I/O>
++typedef struct {
++    TPMI_ALG_SYM_OBJECT    algorithm;
++    TPMU_SYM_KEY_BITS      keyBits;
++    TPMU_SYM_MODE          mode;
++} TPMT_SYM_DEF_OBJECT;
++
++// Table 126 -- TPM2B_SYM_KEY Structure <I/O>
++typedef struct {
++    UINT16    size;
++    BYTE      buffer[MAX_SYM_KEY_BYTES];
++} TPM2B_SYM_KEY;
++
++// Table 127 -- TPMS_SYMCIPHER_PARMS Structure <I/O>
++typedef struct {
++    TPMT_SYM_DEF_OBJECT    sym;
++} TPMS_SYMCIPHER_PARMS;
++
++// Table 128 -- TPM2B_SENSITIVE_DATA Structure <I/O>
++typedef struct {
++    UINT16    size;
++    BYTE      buffer[MAX_SYM_DATA];
++} TPM2B_SENSITIVE_DATA;
++
++// Table 129 -- TPMS_SENSITIVE_CREATE Structure <I>
++typedef struct {
++    TPM2B_AUTH              userAuth;
++    TPM2B_SENSITIVE_DATA    data;
++} TPMS_SENSITIVE_CREATE;
++
++// Table 130 -- TPM2B_SENSITIVE_CREATE Structure <I,S>
++typedef struct {
++    UINT16                   size;
++    TPMS_SENSITIVE_CREATE    sensitive;
++} TPM2B_SENSITIVE_CREATE;
++
++// Table 131 -- TPMS_SCHEME_SIGHASH Structure <I/O>
++typedef struct {
++    TPMI_ALG_HASH    hashAlg;
++} TPMS_SCHEME_SIGHASH;
++
++// Table 132 -- TPMI_ALG_KEYEDHASH_SCHEME Type <I/O>
++typedef TPM_ALG_ID TPMI_ALG_KEYEDHASH_SCHEME;
++
++// Table 133 -- HMAC_SIG_SCHEME Types <I/O>
++typedef TPMS_SCHEME_SIGHASH    TPMS_SCHEME_HMAC;
++
++// Table 134 -- TPMS_SCHEME_XOR Structure <I/O>
++typedef struct {
++    TPMI_ALG_HASH    hashAlg;
++    TPMI_ALG_KDF     kdf;
++} TPMS_SCHEME_XOR;
++
++// Table 135 -- TPMU_SCHEME_KEYEDHASH Union <I/O,S>
++typedef union {
++#ifdef TPM2_ALG_HMAC
++	TPMS_SCHEME_HMAC  hmac;
++#endif
++#ifdef TPM2_ALG_XOR
++    TPMS_SCHEME_XOR  xor;
++#endif
++
++} TPMU_SCHEME_KEYEDHASH ;
++
++// Table 136 -- TPMT_KEYEDHASH_SCHEME Structure <I/O>
++typedef struct {
++    TPMI_ALG_KEYEDHASH_SCHEME    scheme;
++    TPMU_SCHEME_KEYEDHASH        details;
++} TPMT_KEYEDHASH_SCHEME;
++
++// Table 137 -- RSA_SIG_SCHEMES Types <I/O>
++typedef TPMS_SCHEME_SIGHASH    TPMS_SCHEME_RSASSA;
++typedef TPMS_SCHEME_SIGHASH    TPMS_SCHEME_RSAPSS;
++
++// Table 138 -- ECC_SIG_SCHEMES Types <I/O>
++typedef TPMS_SCHEME_SIGHASH    TPMS_SCHEME_ECDSA;
++typedef TPMS_SCHEME_SIGHASH    TPMS_SCHEME_SM2;
++
++// Table 139 -- TPMS_SCHEME_ECDAA Structure <I/O>
++typedef struct {
++    TPMI_ALG_HASH    hashAlg;
++    UINT16           count;
++} TPMS_SCHEME_ECDAA;
++
++// Table 140 -- TPMS_SCHEME_ECSCHNORR Structure <I/O>
++typedef struct {
++    TPMI_ALG_HASH    hashAlg;
++    UINT16           count;
++} TPMS_SCHEME_ECSCHNORR;
++
++// Table 141 -- TPMU_SIG_SCHEME Union <I/O,S>
++typedef union {
++#ifdef TPM2_ALG_RSASSA
++    TPMS_SCHEME_RSASSA  rsassa;
++#endif
++#ifdef TPM2_ALG_RSAPSS
++    TPMS_SCHEME_RSAPSS  rsapss;
++#endif
++#ifdef TPM2_ALG_ECDSA
++    TPMS_SCHEME_ECDSA  ecdsa;
++#endif
++#ifdef TPM2_ALG_SM2
++    TPMS_SCHEME_SM2  sm2;
++#endif
++#ifdef TPM2_ALG_ECDAA
++    TPMS_SCHEME_ECDAA  ecdaa;
++#endif
++#ifdef TPM2_ALG_ECSCHNORR
++    TPMS_SCHEME_ECSCHNORR  ecSchnorr;
++#endif
++#ifdef TPM2_ALG_HMAC
++    TPMS_SCHEME_HMAC  hmac;
++#endif
++    TPMS_SCHEME_SIGHASH  any;
++
++} TPMU_SIG_SCHEME ;
++
++// Table 142 -- TPMT_SIG_SCHEME Structure <I/O>
++typedef struct {
++    TPMI_ALG_SIG_SCHEME    scheme;
++    TPMU_SIG_SCHEME        details;
++} TPMT_SIG_SCHEME;
++
++// Table 143 -- TPMS_SCHEME_OAEP Structure <I/O>
++typedef struct {
++    TPMI_ALG_HASH    hashAlg;
++} TPMS_SCHEME_OAEP;
++
++// Table 144 -- TPMS_SCHEME_ECDH Structure <I/O>
++typedef struct {
++    TPMI_ALG_HASH    hashAlg;
++} TPMS_SCHEME_ECDH;
++
++// Table 145 -- TPMS_SCHEME_MGF1 Structure <I/O>
++typedef struct {
++    TPMI_ALG_HASH    hashAlg;
++} TPMS_SCHEME_MGF1;
++
++// Table 146 -- TPMS_SCHEME_KDF1_SP800_56a Structure <I/O>
++typedef struct {
++    TPMI_ALG_HASH    hashAlg;
++} TPMS_SCHEME_KDF1_SP800_56a;
++
++// Table 147 -- TPMS_SCHEME_KDF2 Structure <I/O>
++typedef struct {
++    TPMI_ALG_HASH    hashAlg;
++} TPMS_SCHEME_KDF2;
++
++// Table 148 -- TPMS_SCHEME_KDF1_SP800_108 Structure <I/O>
++typedef struct {
++    TPMI_ALG_HASH    hashAlg;
++} TPMS_SCHEME_KDF1_SP800_108;
++
++// Table 149 -- TPMU_KDF_SCHEME Union <I/O,S>
++typedef union {
++#ifdef TPM2_ALG_MGF1
++    TPMS_SCHEME_MGF1  mgf1;
++#endif
++#ifdef TPM2_ALG_KDF1_SP800_56a
++    TPMS_SCHEME_KDF1_SP800_56a  kdf1_SP800_56a;
++#endif
++#ifdef TPM2_ALG_KDF2
++    TPMS_SCHEME_KDF2  kdf2;
++#endif
++#ifdef TPM2_ALG_KDF1_SP800_108
++    TPMS_SCHEME_KDF1_SP800_108  kdf1_sp800_108;
++#endif
++
++} TPMU_KDF_SCHEME ;
++
++// Table 150 -- TPMT_KDF_SCHEME Structure <I/O>
++typedef struct {
++    TPMI_ALG_KDF       scheme;
++    TPMU_KDF_SCHEME    details;
++} TPMT_KDF_SCHEME;
++typedef TPM_ALG_ID TPMI_ALG_ASYM_SCHEME;
++
++// Table 152 -- TPMU_ASYM_SCHEME Union <I/O>
++typedef union {
++#ifdef TPM2_ALG_RSASSA
++    TPMS_SCHEME_RSASSA  rsassa;
++#endif
++#ifdef TPM2_ALG_RSAPSS
++    TPMS_SCHEME_RSAPSS  rsapss;
++#endif
++#ifdef TPM2_ALG_OAEP
++    TPMS_SCHEME_OAEP  oaep;
++#endif
++#ifdef TPM2_ALG_ECDSA
++    TPMS_SCHEME_ECDSA  ecdsa;
++#endif
++#ifdef TPM2_ALG_SM2
++    TPMS_SCHEME_SM2  sm2;
++#endif
++#ifdef TPM2_ALG_ECDAA
++    TPMS_SCHEME_ECDAA  ecdaa;
++#endif
++#ifdef TPM2_ALG_ECSCHNORR
++    TPMS_SCHEME_ECSCHNORR  ecSchnorr;
++#endif
++    TPMS_SCHEME_SIGHASH  anySig;
++
++} TPMU_ASYM_SCHEME ;
++
++typedef struct {
++    TPMI_ALG_ASYM_SCHEME    scheme;
++    TPMU_ASYM_SCHEME        details;
++} TPMT_ASYM_SCHEME;
++
++// Table 154 -- TPMI_ALG_RSA_SCHEME Type <I/O>
++typedef TPM_ALG_ID TPMI_ALG_RSA_SCHEME;
++
++// Table 155 -- TPMT_RSA_SCHEME Structure <I/O>
++typedef struct {
++    TPMI_ALG_RSA_SCHEME    scheme;
++    TPMU_ASYM_SCHEME       details;
++} TPMT_RSA_SCHEME;
++
++// Table 156 -- TPMI_ALG_RSA_DECRYPT Type <I/O>
++typedef TPM_ALG_ID TPMI_ALG_RSA_DECRYPT;
++
++// Table 157 -- TPMT_RSA_DECRYPT Structure <I/O>
++typedef struct {
++    TPMI_ALG_RSA_DECRYPT    scheme;
++    TPMU_ASYM_SCHEME        details;
++} TPMT_RSA_DECRYPT;
++
++// Table 158 -- TPM2B_PUBLIC_KEY_RSA Structure <I/O>
++typedef struct {
++    UINT16    size;
++    BYTE      buffer[MAX_RSA_KEY_BYTES];
++} TPM2B_PUBLIC_KEY_RSA;
++
++// Table 159 -- TPMI_RSA_KEY_BITS Type <I/O>
++typedef TPM_KEY_BITS TPMI_RSA_KEY_BITS;
++
++// Table 160 -- TPM2B_PRIVATE_KEY_RSA Structure <I/O>
++typedef struct {
++    UINT16    size;
++    BYTE      buffer[MAX_RSA_KEY_BYTES/2];
++} TPM2B_PRIVATE_KEY_RSA;
++
++// Table 162 -- TPM2B_ECC_PARAMETER
++typedef struct {
++	UINT16 size;
++	BYTE buffer[MAX_ECC_KEY_BYTES];
++} TPM2B_ECC_PARAMETER;
++
++// Table 163 -- TPMS_ECC_POINT Structure <I/O>
++typedef struct {
++    TPM2B_ECC_PARAMETER    x;
++    TPM2B_ECC_PARAMETER    y;
++} TPMS_ECC_POINT;
++
++// Table 164 -- TPMI_ALG_ECC_SCHEME Type <I/O>
++typedef TPM_ALG_ID TPMI_ALG_ECC_SCHEME;
++
++typedef UINT16 TPM_ECC_CURVE;
++
++// Table 165 -- TPMI_ECC_CURVE Type <I/O>
++typedef TPM_ECC_CURVE TPMI_ECC_CURVE;
++
++// Table 166 -- TPMT_ECC_SCHEME Structure <I/O>
++typedef struct {
++    TPMI_ALG_ECC_SCHEME    scheme;
++    TPMU_SIG_SCHEME        details;
++} TPMT_ECC_SCHEME;
++
++// Table 175 -- TPMI_ALG_PUBLIC Type <I/O>
++typedef TPM_ALG_ID TPMI_ALG_PUBLIC;
++
++// Table 176 -- TPMU_PUBLIC_ID Union <I/O,S>
++typedef union {
++#ifdef TPM2_ALG_KEYEDHASH
++    TPM2B_DIGEST  keyedHash;
++#endif
++#ifdef TPM2_ALG_SYMCIPHER
++    TPM2B_DIGEST  sym;
++#endif
++#ifdef TPM2_ALG_RSA
++    TPM2B_PUBLIC_KEY_RSA  rsa;
++#endif
++#ifdef TPM2_ALG_ECC
++    TPMS_ECC_POINT  ecc;
++#endif
++
++} TPMU_PUBLIC_ID ;
++
++// Table 177 -- TPMS_KEYEDHASH_PARMS Structure <I/O>
++typedef struct {
++    TPMT_KEYEDHASH_SCHEME    scheme;
++} TPMS_KEYEDHASH_PARMS;
++typedef struct {
++    TPMT_SYM_DEF_OBJECT    symmetric;
++    TPMT_ASYM_SCHEME       scheme;
++} TPMS_ASYM_PARMS;
++
++// Table 179 -- TPMS_RSA_PARMS Structure <I/O>
++typedef struct {
++    TPMT_SYM_DEF_OBJECT    symmetric;
++    TPMT_RSA_SCHEME        scheme;
++    TPMI_RSA_KEY_BITS      keyBits;
++    UINT32                 exponent;
++} TPMS_RSA_PARMS;
++
++// Table 180 -- TPMS_ECC_PARMS Structure <I/O>
++typedef struct {
++    TPMT_SYM_DEF_OBJECT    symmetric;
++    TPMT_ECC_SCHEME        scheme;
++    TPMI_ECC_CURVE         curveID;
++    TPMT_KDF_SCHEME        kdf;
++} TPMS_ECC_PARMS;
++
++// Table 181 -- TPMU_PUBLIC_PARMS Union <I/O,S>
++typedef union {
++#ifdef TPM2_ALG_KEYEDHASH
++    TPMS_KEYEDHASH_PARMS  keyedHashDetail;
++#endif
++#ifdef TPM2_ALG_SYMCIPHER
++    TPMT_SYM_DEF_OBJECT  symDetail;
++#endif
++#ifdef TPM2_ALG_RSA
++    TPMS_RSA_PARMS  rsaDetail;
++#endif
++#ifdef TPM2_ALG_ECC
++    TPMS_ECC_PARMS  eccDetail;
++#endif
++    TPMS_ASYM_PARMS  asymDetail;
++
++} TPMU_PUBLIC_PARMS ;
++
++// Table 182 -- TPMT_PUBLIC_PARMS Structure <I/O>
++typedef struct {
++    TPMI_ALG_PUBLIC      type;
++    TPMU_PUBLIC_PARMS    parameters;
++} TPMT_PUBLIC_PARMS;
++
++// Table 183 -- TPMT_PUBLIC Structure <I/O>
++typedef struct {
++    TPMI_ALG_PUBLIC      type;
++    TPMI_ALG_HASH        nameAlg;
++    TPMA_OBJECT          objectAttributes;
++    TPM2B_DIGEST         authPolicy;
++    TPMU_PUBLIC_PARMS    parameters;
++    TPMU_PUBLIC_ID       unique;
++} TPMT_PUBLIC;
++
++// Table 184 -- TPM2B_PUBLIC
++typedef struct {
++	UINT16		size;
++	TPMT_PUBLIC	publicArea;
++} TPM2B_PUBLIC;
++
++// Table 185 -- TPMU_SENSITIVE_COMPOSITE Union <I/O,S>
++typedef union {
++#ifdef TPM2_ALG_RSA
++    TPM2B_PRIVATE_KEY_RSA  rsa;
++#endif
++#ifdef TPM2_ALG_ECC
++    TPM2B_ECC_PARAMETER  ecc;
++#endif
++#ifdef TPM2_ALG_KEYEDHASH
++    TPM2B_SENSITIVE_DATA  bits;
++#endif
++#ifdef TPM2_ALG_SYMCIPHER
++    TPM2B_SYM_KEY  sym;
++#endif
++    TPM2B_SENSITIVE_DATA  any;
++
++} TPMU_SENSITIVE_COMPOSITE ;
++
++// Table 186 -- TPMT_SENSITIVE Structure <I/O>
++typedef struct {
++    TPMI_ALG_PUBLIC             sensitiveType;
++    TPM2B_AUTH                  authValue;
++    TPM2B_DIGEST                seedValue;
++    TPMU_SENSITIVE_COMPOSITE    sensitive;
++} TPMT_SENSITIVE;
++
++// Table 187 -- TPM2B_SENSITIVE Structure <I/O>
++typedef struct {
++    UINT16            size;
++    TPMT_SENSITIVE    sensitiveArea;
++} TPM2B_SENSITIVE;
++
++typedef struct {
++    TPM2B_DIGEST      integrityOuter;
++    TPM2B_DIGEST      integrityInner;
++    TPMT_SENSITIVE    sensitive;
++} _PRIVATE;
++
++// Table 189 -- TPM2B_PRIVATE Structure <I/O,S>
++typedef struct {
++    UINT16    size;
++    BYTE      buffer[sizeof(_PRIVATE)];
++} TPM2B_PRIVATE;
++
++// Table 204 -- TPMS_CREATION_DATA <OUT>
++typedef struct {
++	TPML_PCR_SELECTION	pcrSelect;
++	TPM2B_DIGEST		pcrDigest;
++	TPMA_LOCALITY		locality;
++	TPM_ALG_ID			parentNameAlg;
++	TPM2B_NAME			parentName;
++	TPM2B_NAME			parentQualifiedName;
++	TPM2B_DATA			outsideInfo;
++} TPMS_CREATION_DATA;
++
++// Table 205 -- TPM2B_CREATION_DATA <OUT>
++typedef struct {
++	UINT16 size;
++	TPMS_CREATION_DATA creationData;
++} TPM2B_CREATION_DATA;
++
++/* the following structs is not part of standard struct defined in TPM2 spec */
++typedef struct {
++	UINT32			size;
++	TPM_RH			sessionHandle;
++	TPM2B_NONCE		nonce;
++	TPMA_SESSION	sessionAttributes;
++	TPM2B_AUTH		auth;
++} TPM_AuthArea;
++
++typedef struct {
++	TPM2B_SENSITIVE_CREATE	inSensitive;
++	TPM2B_PUBLIC			inPublic;
++	TPM2B_DATA				outsideInfo;
++	TPML_PCR_SELECTION		creationPCR;
++} TPM2_Create_Params_in;
++
++typedef TPM2_Create_Params_in	TPM2_CreatePrimary_Params_in;
++
++typedef struct {
++	TPM2B_PUBLIC		outPublic;
++	TPM2B_CREATION_DATA	creationData;
++	TPM2B_DIGEST		creationHash;
++	TPMT_TK_CREATION	creationTicket;
++	TPM2B_NAME			name;
++} TPM2_CreatePrimary_Params_out;
++
++typedef struct {
++	TPM2B_PRIVATE		outPrivate;
++	TPM2B_PUBLIC		outPublic;
++	TPM2B_CREATION_DATA	creationData;
++	TPM2B_DIGEST	creationHash;
++	TPMT_TK_CREATION	creationTicket;
++} TPM2_Create_Params_out;
++typedef struct {
++	TPM2B_PRIVATE	Private;
++	TPM2B_PUBLIC	Public;
++} TPM2_RSA_KEY;
++
++/*
++ * TPMA_OBJECT Bits
++ */
++#define fixedTPM				((1 << 1))
++#define stClear					((1 << 2))
++#define fixedParent				((1 << 4))
++#define sensitiveDataOrigin		((1 << 5))
++#define userWithAuth			((1 << 6))
++#define adminWithPolicy			((1 << 7))
++#define noDA					((1 << 10))
++#define encryptedDuplication	((1 << 11))
++#define restricted				((1 << 16))
++#define decrypt					((1 << 17))
++#define sign					((1 << 18))
++
++#endif
